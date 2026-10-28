@@ -27,11 +27,9 @@ int main() {
         std::cout << command << " is a shell builtin" << std::endl;
       } else
       {
-        std::cout << command << " is not a shell builtin" << std::endl;
+        std::cout << command << ": not found" << std::endl;
       }
-    }
-    
-    if(input == "exit")
+    } else if(input == "exit")
     {
       break;
     } else if (input.substr(0,5) == "echo ")
