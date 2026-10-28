@@ -18,10 +18,10 @@ int main() {
 
     std::string input;
     std::getline(std::cin, input);
-
+    std::string command = input.substr(5);
     if (input.substr(0,5) == "type ")
     {
-      std::string command = input.substr(5);
+      
       if (command == "exit" || command == "echo" || command == "type")
       {
         std::cout << command << " is a shell builtin" << std::endl;
