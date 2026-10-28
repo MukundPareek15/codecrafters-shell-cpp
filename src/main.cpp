@@ -59,7 +59,7 @@ int main() {
 
         if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
           {
-            std::cout << command << " is " << candidate << std::endl;
+            std::cout << command << " is " << candidate.string() << std::endl;
             found = true;
             break;
           }
