@@ -18,10 +18,10 @@ int main() {
 
     std::string input;
     std::getline(std::cin, input);
-    std::string command = input.substr(5);
+
     if (input.substr(0,5) == "type ")
     {
-      
+      std::string command = input.substr(5);
       if (command == "exit" || command == "echo" || command == "type")
       {
         std::cout << command << " is a shell builtin" << std::endl;
@@ -65,8 +65,15 @@ int main() {
         std::cout << command << ": not found" << std::endl;
       }
 
+    } else if(input == "exit")
+    {
+      break;
+    } else if (input.substr(0,5) == "echo ")
+    {
+      std::cout << input.substr(5) << std::endl;
     } else if(const char* path = std::getenv("PATH"))
     {
+      std::string command = input;
       std::string pathStr(path);
       std::stringstream ss(pathStr);
       std::vector<std::string> directories;
@@ -91,12 +98,6 @@ int main() {
       {
         std::cout << command << ": not found" << std::endl;
       }
-    } else if(input == "exit")
-    {
-      break;
-    } else if (input.substr(0,5) == "echo ")
-    {
-      std::cout << input.substr(5) << std::endl;
     } else
     {
       std::cout << input << ": command not found" << std::endl;
