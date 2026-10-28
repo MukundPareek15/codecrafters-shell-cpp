@@ -16,8 +16,6 @@ int main() {
   {
     std::cout << "$ ";
 
-    
-
     std::string input;
     std::getline(std::cin, input);
 
@@ -46,23 +44,15 @@ int main() {
 
         for (const auto& dir : directories)
         {
-            std::filesystem::path candidate =
-                std::filesystem::path(dir) / command;
+          std::filesystem::path candidate =
+            std::filesystem::path(dir) / command;
 
-          /* IF candidate is a regular file
-       AND candidate has execute permission:
-
-        PRINT command + " is " + candidate
-
-        found = true
-        BREAK out of loop*/
-
-        if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
-          {
-            std::cout << command << " is " << candidate.string() << std::endl;
-            found = true;
-            break;
-          }
+            if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
+              {
+                std::cout << command << " is " << candidate.string() << std::endl;
+                found = true;
+                break;
+              }
         }
 
         if (!found)
@@ -71,6 +61,33 @@ int main() {
         }
         
       }else      
+      {
+        std::cout << command << ": not found" << std::endl;
+      }
+
+    } else if(const char* path = std::getenv("PATH"))
+    {
+      std::string pathStr(path);
+      std::stringstream ss(pathStr);
+      std::vector<std::string> directories;
+      std::string directory;
+      while (std::getline(ss, directory, ':'))
+      {
+        directories.push_back(directory);
+      }
+      bool found = false;
+      for (const auto& dir : directories)
+      {
+        std::filesystem::path candidate =
+          std::filesystem::path(dir) / command;
+          if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
+            {
+              std::cout << command << " is " << candidate.string() << "~ the program is executing here"<< std::endl;
+              found = true;
+              break;
+            }
+      }
+      if (!found)
       {
         std::cout << command << ": not found" << std::endl;
       }
