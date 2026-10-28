@@ -6,101 +6,207 @@
 #include <vector>
 #include <filesystem>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <cerrno>
+#include <cstdio>
 
-int main() {
-  // Flush after every std::cout / std:cerr
-  std::cout << std::unitbuf;
-  std::cerr << std::unitbuf;
+// Find an executable using PATH or an explicit file path.
+std::string findExecutable(const std::string& command)
+{
+    namespace fs = std::filesystem;
 
-  while(true)
-  {
-    std::cout << "$ ";
-
-    std::string input;
-    std::getline(std::cin, input);
-
-    if (input.substr(0,5) == "type ")
+    auto isExecutable = [](const fs::path& candidate)
     {
-      std::string command = input.substr(5);
-      if (command == "exit" || command == "echo" || command == "type")
-      {
-        std::cout << command << " is a shell builtin" << std::endl;
-      } else if (const char* path = std::getenv("PATH"))
-      {
-        std::string pathStr(path);
+        std::error_code ec;
+        return fs::is_regular_file(candidate, ec) &&
+               access(candidate.c_str(), X_OK) == 0;
+    };
 
-        std::stringstream ss(pathStr);
-
-        std::vector<std::string> directories;
-
-        std::string directory;
-
-        while (std::getline(ss, directory, ':'))
-        {
-          directories.push_back(directory);
-        }
-
-        bool found = false;
-
-        for (const auto& dir : directories)
-        {
-          std::filesystem::path candidate =
-            std::filesystem::path(dir) / command;
-
-            if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
-              {
-                std::cout << command << " is " << candidate.string() << std::endl;
-                found = true;
-                break;
-              }
-        }
-
-        if (!found)
-        {
-          std::cout << command << ": not found" << std::endl;
-        }
-        
-      }else      
-      {
-        std::cout << command << ": not found" << std::endl;
-      }
-
-    } else if(input == "exit")
+    // Handle absolute and relative paths such as /bin/ls or ./program
+    if (command.find('/') != std::string::npos)
     {
-      break;
-    } else if (input.substr(0,5) == "echo ")
-    {
-      std::cout << input.substr(5) << std::endl;
-    } else if(const char* path = std::getenv("PATH"))
-    {
-      std::string command = input;
-      std::string pathStr(path);
-      std::stringstream ss(pathStr);
-      std::vector<std::string> directories;
-      std::string directory;
-      while (std::getline(ss, directory, ':'))
-      {
-        directories.push_back(directory);
-      }
-      bool found = false;
-      for (const auto& dir : directories)
-      {
-        std::filesystem::path candidate =
-          std::filesystem::path(dir) / command;
-          if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
-            {
-              std::cout << command << " is " << candidate.string() << "~ the program is executing here"<< std::endl;
-              found = true;
-              break;
-            }
-      }
-      if (!found)
-      {
-        std::cout << command << ": not found" << std::endl;
-      }
-    } else
-    {
-      std::cout << input << ": command not found" << std::endl;
+        return isExecutable(command) ? command : "";
     }
-  }  
+
+    const char* path = std::getenv("PATH");
+
+    if (!path)
+        return "";
+
+    std::stringstream ss(path);
+    std::string directory;
+
+    while (std::getline(ss, directory, ':'))
+    {
+        fs::path candidate =
+            fs::path(directory.empty() ? "." : directory) / command;
+
+        if (isExecutable(candidate))
+        {
+            return candidate.string();
+        }
+    }
+
+    return "";
+}
+
+int main()
+{
+    // Flush after every std::cout / std::cerr
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
+    while (true)
+    {
+        std::cout << "$ ";
+
+        std::string input;
+
+        if (!std::getline(std::cin, input))
+        {
+            break;
+        }
+
+        // Parse command and arguments
+        std::istringstream stream(input);
+
+        std::string command;
+        stream >> command;
+
+        if (command.empty())
+        {
+            continue;
+        }
+
+        std::vector<std::string> arguments;
+        std::string arg;
+
+        while (stream >> arg)
+        {
+            arguments.push_back(arg);
+        }
+
+        // Builtin: exit
+        if (command == "exit")
+        {
+            return arguments.empty() ? 0 : std::atoi(arguments[0].c_str());
+        }
+
+        // Builtin: echo
+        else if (command == "echo")
+        {
+            for (size_t i = 0; i < arguments.size(); i++)
+            {
+                if (i > 0)
+                    std::cout << " ";
+
+                std::cout << arguments[i];
+            }
+
+            std::cout << std::endl;
+        }
+
+        // Builtin: type
+        else if (command == "type")
+        {
+            if (arguments.empty())
+            {
+                std::cout << "type: missing operand" << std::endl;
+                continue;
+            }
+
+            std::string target = arguments[0];
+
+            if (target == "exit" ||
+                target == "echo" ||
+                target == "type")
+            {
+                std::cout << target
+                          << " is a shell builtin" << std::endl;
+            }
+            else
+            {
+                std::string executablePath = findExecutable(target);
+
+                if (!executablePath.empty())
+                {
+                    std::cout << target << " is "
+                              << executablePath << std::endl;
+                }
+                else
+                {
+                    std::cout << target << ": not found" << std::endl;
+                }
+            }
+        }
+
+        // External commands
+        else
+        {
+            std::string executablePath = findExecutable(command);
+
+            if (executablePath.empty())
+            {
+                std::cout << command
+                          << ": command not found" << std::endl;
+                continue;
+            }
+
+            // argv[0] must be the command name.
+            std::vector<std::string> programArgs;
+            programArgs.push_back(command);
+
+            for (const auto& argument : arguments)
+            {
+                programArgs.push_back(argument);
+            }
+
+            // Convert strings into C-style argument pointers.
+            std::vector<char*> argv;
+
+            for (auto& argument : programArgs)
+            {
+                argv.push_back(argument.data());
+            }
+
+            // execv requires a null-terminated argument array.
+            argv.push_back(nullptr);
+
+            // Create a child process.
+            pid_t pid = fork();
+
+            if (pid < 0)
+            {
+                perror("fork");
+            }
+            else if (pid == 0)
+            {
+                // CHILD PROCESS
+                execv(executablePath.c_str(), argv.data());
+
+                // Only reached if execv fails.
+                perror("execv");
+                _exit(127);
+            }
+            else
+            {
+                // PARENT PROCESS
+                int status;
+                pid_t result;
+
+                do
+                {
+                    result = waitpid(pid, &status, 0);
+                }
+                while (result == -1 && errno == EINTR);
+
+                if (result == -1)
+                {
+                    perror("waitpid");
+                }
+            }
+        }
+    }
+
+    return 0;
 }
