@@ -2,16 +2,10 @@
 #include <iostream>
 #include <string>
 #include <cstdlib>
-
-/*When type receives a command input, your shell must follow these steps:
-
-Check if the command is a builtin command (like exit or echo). If it is, report it as a builtin (<command> is a shell builtin) and stop.
-If the command is not a builtin, your shell must go through every directory in PATH. For each directory:
-Check if a file with the command name exists.
-Check if the file has execute permissions.
-If the file exists and has execute permissions, print <command> is <full_path> and stop.
-If the file exists but lacks execute permissions, skip it and continue to the next directory.
-If no executable is found in any directory, print <command>: not found.*/
+#include <sstream>
+#include <vector>
+#include <filesystem>
+#include <unistd.h>
 
 int main() {
   // Flush after every std::cout / std:cerr
@@ -22,7 +16,7 @@ int main() {
   {
     std::cout << "$ ";
 
-    const char* path = std::getenv("PATH");
+    
 
     std::string input;
     std::getline(std::cin, input);
@@ -33,7 +27,50 @@ int main() {
       if (command == "exit" || command == "echo" || command == "type")
       {
         std::cout << command << " is a shell builtin" << std::endl;
-      } else
+      } else if (const char* path = std::getenv("PATH"))
+      {
+        std::string pathStr(path);
+
+        std::stringstream ss(pathStr);
+
+        std::vector<std::string> directories;
+
+        std::string directory;
+
+        while (std::getline(ss, directory, ':'))
+        {
+          directories.push_back(directory);
+        }
+
+        bool found = false;
+
+        for (const auto& dir : directories)
+        {
+            std::filesystem::path candidate =
+                std::filesystem::path(dir) / command;
+
+          /* IF candidate is a regular file
+       AND candidate has execute permission:
+
+        PRINT command + " is " + candidate
+
+        found = true
+        BREAK out of loop*/
+
+        if (std::filesystem::is_regular_file(candidate) && access(candidate.c_str(), X_OK) == 0)
+          {
+            std::cout << command << " is " << candidate << std::endl;
+            found = true;
+            break;
+          }
+        }
+
+        if (!found)
+        {
+          std::cout << command << ": not found" << std::endl;
+        }
+        
+      }else      
       {
         std::cout << command << ": not found" << std::endl;
       }
@@ -47,7 +84,5 @@ int main() {
     {
       std::cout << input << ": command not found" << std::endl;
     }
-  }
-
-  
+  }  
 }
