@@ -1,6 +1,17 @@
 
 #include <iostream>
 #include <string>
+#include <cstdlib>
+
+/*When type receives a command input, your shell must follow these steps:
+
+Check if the command is a builtin command (like exit or echo). If it is, report it as a builtin (<command> is a shell builtin) and stop.
+If the command is not a builtin, your shell must go through every directory in PATH. For each directory:
+Check if a file with the command name exists.
+Check if the file has execute permissions.
+If the file exists and has execute permissions, print <command> is <full_path> and stop.
+If the file exists but lacks execute permissions, skip it and continue to the next directory.
+If no executable is found in any directory, print <command>: not found.*/
 
 int main() {
   // Flush after every std::cout / std:cerr
@@ -11,13 +22,10 @@ int main() {
   {
     std::cout << "$ ";
 
+    const char* path = std::getenv("PATH");
+
     std::string input;
     std::getline(std::cin, input);
-
-    /*In this stage, you'll implement the type builtin for your shell.
-
-    The type Builtin
-    The type builtin is used to determine how a command would be interpreted if it were used. It checks whether a command is a builtin, an executable file, or unrecognized.*/
 
     if (input.substr(0,5) == "type ")
     {
