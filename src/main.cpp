@@ -104,6 +104,12 @@ int main()
             std::cout << std::endl;
         }
 
+        else if (command == "pwd")
+        {
+          std::filesystem::path cwd = std::filesystem::current_path();
+          std::cout << cwd.string() << std::endl;
+        }
+
         // Builtin: type
         else if (command == "type")
         {
@@ -117,7 +123,8 @@ int main()
 
             if (target == "exit" ||
                 target == "echo" ||
-                target == "type")
+                target == "type" ||
+                target == "pwd")
             {
                 std::cout << target << " is a shell builtin" << std::endl;
             }
