@@ -111,13 +111,25 @@ int main()
         }
 
         else if (command == "cd")
-        {
-          if (arguments.size() < 2)
-          {
-            continue;
-          }
+        {          
+          std::filesystem::path target;
 
-          std::filesystem::path target = arguments[1];
+          if (arguments.empty() || arguments[0] == "~")
+          {
+            const char* home = std::getenv("HOME");
+
+            if(!home)
+            {
+              std::cerr << "cd: HOME not set \n";
+              continue;
+            }
+
+            target = home;
+          }
+          else
+          {
+            target = arguments[0];
+          }
 
           std::error_code ec;
 
