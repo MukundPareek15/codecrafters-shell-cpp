@@ -112,12 +112,12 @@ int main()
 
         else if (command == "cd")
         {
-          if (args.size() < 2)
+          if (arg.size() < 2)
           {
             continue;
           }
 
-          std::filesystem::path target = args[1];
+          std::filesystem::path target = arg[1];
 
           std::error_code ec;
 
