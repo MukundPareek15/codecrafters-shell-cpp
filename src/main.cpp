@@ -18,8 +18,7 @@ std::string findExecutable(const std::string& command)
     auto isExecutable = [](const fs::path& candidate)
     {
         std::error_code ec;
-        return fs::is_regular_file(candidate, ec) &&
-               access(candidate.c_str(), X_OK) == 0;
+        return fs::is_regular_file(candidate, ec) && access(candidate.c_str(), X_OK) == 0;
     };
 
     // Handle absolute and relative paths such as /bin/ls or ./program
@@ -38,8 +37,7 @@ std::string findExecutable(const std::string& command)
 
     while (std::getline(ss, directory, ':'))
     {
-        fs::path candidate =
-            fs::path(directory.empty() ? "." : directory) / command;
+        fs::path candidate = fs::path(directory.empty() ? "." : directory) / command;
 
         if (isExecutable(candidate))
         {
@@ -121,8 +119,7 @@ int main()
                 target == "echo" ||
                 target == "type")
             {
-                std::cout << target
-                          << " is a shell builtin" << std::endl;
+                std::cout << target << " is a shell builtin" << std::endl;
             }
             else
             {
@@ -130,8 +127,7 @@ int main()
 
                 if (!executablePath.empty())
                 {
-                    std::cout << target << " is "
-                              << executablePath << std::endl;
+                    std::cout << target << " is " << executablePath << std::endl;
                 }
                 else
                 {
@@ -147,8 +143,7 @@ int main()
 
             if (executablePath.empty())
             {
-                std::cout << command
-                          << ": command not found" << std::endl;
+                std::cout << command << ": command not found" << std::endl;
                 continue;
             }
 
