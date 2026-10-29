@@ -110,6 +110,27 @@ int main()
           std::cout << cwd.string() << std::endl;
         }
 
+        else if (command == "cd")
+        {
+          if (args.size() < 2)
+          {
+            continue;
+          }
+
+          std::filesystem::path target = args[1];
+
+          std::error_code ec;
+
+          std::filesystem::current_path(target, ec);
+
+          if(ec)
+          {
+            std::cout <<"cd: " << target.string() << ": " << ec.message() << std::endl;
+          }
+
+          continue;
+        }
+
         // Builtin: type
         else if (command == "type")
         {
@@ -124,7 +145,8 @@ int main()
             if (target == "exit" ||
                 target == "echo" ||
                 target == "type" ||
-                target == "pwd")
+                target == "pwd"  ||
+                target == "cd")
             {
                 std::cout << target << " is a shell builtin" << std::endl;
             }
