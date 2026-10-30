@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 #include <filesystem>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <cerrno>
@@ -357,6 +358,28 @@ int main()
             else if (pid == 0)
             {
                 // CHILD PROCESS
+
+                if (!outputFile.empty())
+                {
+                    int fd = open(outputFile.c_str(), O_WRONLY |O_CREAT | O_TRUNC, 0644);
+
+                    if (fd == -1)
+                    {
+                        perror("open");
+                        _exit(1);
+                    }
+
+                    if (dup2(fd, STDOUT_FILENO) == -1)
+                    {
+                        perror("dup2");
+                        close(fd);
+                        _exit(1);
+                    }
+
+                    close(fd);
+                    std::cout.flush();
+                }
+
                 execv(executablePath.c_str(), argv.data());
 
                 // Only reached if execv fails.
