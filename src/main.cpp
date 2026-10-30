@@ -387,7 +387,7 @@ std::vector<std::string> findExecutableCompletions(const std::string& prefix)
 
         std::error_code directoryError;
 
-        fs::directory_iterator it(folder, fs::directory_options:skip_permission_denied, directoryError);
+        fs::directory_iterator it(folder, fs::directory_options::skip_permission_denied, directoryError);
 
         fs::directory_iterator last;
 
