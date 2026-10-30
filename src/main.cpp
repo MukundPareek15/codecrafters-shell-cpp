@@ -10,7 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <terminos.h>
+#include <termios.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
