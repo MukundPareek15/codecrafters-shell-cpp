@@ -104,12 +104,14 @@ int main()
             std::cout << std::endl;
         }
 
+        // Builtin: pwd
         else if (command == "pwd")
         {
           std::filesystem::path cwd = std::filesystem::current_path();
           std::cout << cwd.string() << std::endl;
         }
 
+        // Builtin: cd
         else if (command == "cd")
         {          
           std::filesystem::path target;
