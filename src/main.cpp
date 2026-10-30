@@ -1,3 +1,6 @@
+// Our own personal Shell implementation. It supports a small subset of POSIX shell features, including:
+// - Running external commands with arguments.
+
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -7,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <terminos.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -40,6 +44,43 @@ struct Redirection {
 struct ParsedCommand {
     std::vector<std::string> arguments;
     std::vector<Redirection> redirections;
+};
+
+class TerminalModeGuard 
+{
+public:
+    TerminalModeGuard()
+    {
+        if (!issatty(STDIN_FILENO)) 
+            return;
+
+        if (tcgetattr(STDIN_FILENO, &original_) == -1)
+            return;
+
+        //Disable canonical mode and echoing
+        settings.c_lflag &= ~(ICANON | ECHO);
+
+        //Return after one character
+        settings.c_cc[VMIN] = 1;
+        settings.c_cc[VTIME] = 0;
+
+        active_ = tcsetattr(STDIN_FILENO, TCSANOW, &settings) == 0;
+
+    }
+
+    ~TerminalModeGuard()
+    {
+        if (active_)
+        {
+            tcsetattr(STDIN_FILENO, TCSANOW, &original_);
+        }
+    }
+
+    bool active () const { return active_; }
+
+private:
+    termios original_{};
+    bool active_ = false;
 };
 
 // Separate shell operators from words without interpreting quoted characters as operators.
@@ -284,6 +325,22 @@ bool applyRedirections(const std::vector<Redirection>& redirections) {
     return true;
 }
 
+std::vector<std::string> findBuiltinCompletions(const std::string &prefix)
+{
+    const std::vector<std::string> builtins = {"exit", "echo", "pwd", "cd", "type"};
+    std::vector<std::string> matches;
+
+    for (const auto& builtin : builtins)
+    {
+        if (builtin.rfind(prefix, 0) == 0)
+        {
+            matches.push_back(builtin);
+        }
+    }
+
+    return matches;
+}
+
 // Builtins run in the parent; always restore its standard descriptors afterward.
 class ScopedRedirections {
 public:
@@ -456,6 +513,93 @@ int executeExternal(const ParsedCommand& command) {
     return 1;
 }
 
+bool readInputLine(std::string& input)
+{
+    TerminalModeGuard terminal;
+
+    /*Preserve normal behavior for redirected stdin and environments without a usable terminal*/
+
+    if(!terminal.active())
+    {
+        return static_cast<bool>(std::getline(std::cin, input));
+    }
+
+    input.clear();
+
+    while(true)
+    {
+        char c = '\0';
+
+        ssize_t bytes = read(STDIN_FILENO, &c, 1);
+
+        if (bytes == -1)
+        {
+            if(errno == EINTR)
+                continue;
+            
+            return false;
+        }
+
+        if(c=='\n'||c =='\r')
+        {
+            std::cout << '\n';
+            return true;
+        }
+
+        if(c == 127 || c == '\b')
+        {
+            if(!input.empty())
+            {
+                input.pop_back();
+                std::cout << "\b \b";
+            }
+            continue;
+        }
+
+        //TAB
+        /*\t represents the Tab character, byte value 9 in ASCII.*/
+        if (c == '\t')
+        {
+            // For now we complete only the command word
+            if(input.empty() || input.find_first_of("\t") != std::string::npos)
+            {
+                std::cout << '\a';
+                continue;
+            }
+
+            /*When Tab arrives, we call:*/
+            auto matches = findBuiltinCompletions(input);
+
+            if(matches.size()==1)
+            {
+                /*If only one command matches, we calculate the characters that are missing.*/
+                std::string completion = matches[0].substr(input.size()) + " ";
+
+                input += completion;
+                std::cout << completion;
+            }
+            else
+            {
+                //No unique completion available;
+                std::cout << '\a'
+            }
+            continue;
+        }
+
+        //CTRL+D on an empty line
+        if(c == 4 && input.empty())
+            return false;
+
+        
+        //Ordinary printable input (byte-oriented)
+        if(static_cast<unsigned char>(c) >= 32 && c != 127)
+        {
+            input.push_back(c);
+            std::cout.put(c);
+        }
+    }
+}
+
 int main() {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
@@ -463,26 +607,30 @@ int main() {
     while (true) {
         std::cout << "$ ";
         std::string input;
-        if (!std::getline(std::cin, input)) {
+        if (!readInputLine(input)) {
             break;
         }
 
         ParsedCommand command;
-        try {
+        try 
+        {
             command = parseCommand(tokenize(input));
-        } catch (const std::runtime_error& error) {
+        } catch (const std::runtime_error& error) 
+        {
             std::cerr << "shell: " << error.what() << '\n';
             continue;
         }
 
-        if (command.arguments.empty()) {
+        if (command.arguments.empty()) 
+        {
             // A bare redirection can still create/truncate a file.
             ScopedRedirections redirects;
             redirects.apply(command.redirections);
             continue;
         }
 
-        if (isBuiltin(command.arguments[0])) {
+        if (isBuiltin(command.arguments[0])) 
+        {
             ScopedRedirections redirects;
             if (!redirects.apply(command.redirections)) {
                 continue;
