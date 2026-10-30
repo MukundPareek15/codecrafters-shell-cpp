@@ -387,7 +387,7 @@ std::vector<std::string> findExecutableCompletions(const std::string& prefix)
 
         std::error_code directoryError;
 
-        fs::directiory_iterator it(folder, fs::directory_options:skip_permission_denied, directoryError);
+        fs::directory_iterator it(folder, fs::directory_options:skip_permission_denied, directoryError);
 
         fs::directory_iterator last;
 
@@ -417,7 +417,7 @@ std::vector<std::string> findExecutableCompletions(const std::string& prefix)
             it.increment(directoryError);
         
         }
-        if(end == std:string::npos)
+        if(end == std::string::npos)
             break;
 
         start = end + 1;
