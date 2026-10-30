@@ -37,7 +37,7 @@ std::vector<std::string> tokenize(const std::string &input)
 
         if (mode == QuoteMode::Normal)
         {
-            if(std::isspace(static_cast<unsigned char>)(c))
+            if(std::isspace(static_cast<unsigned char>(c)))
             {
                 if (tokenStarted)
                 {
