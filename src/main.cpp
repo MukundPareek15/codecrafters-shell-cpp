@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <stdexcept>
+#include <algorithm>
 #include <string>
 #include <termios.h>
 #include <sys/wait.h>
@@ -251,11 +252,16 @@ bool isBuiltin(const std::string& name) {
 std::string findExecutable(const std::string& command) {
     namespace fs = std::filesystem;
 
+    /*Not sure if this'll come in use later or be an issue, so commenting at the moment*/
+    // std::error_code ec;
+
     auto executable = [](const fs::path& path) {
         std::error_code error;
         return fs::is_regular_file(path, error) &&
                access(path.c_str(), X_OK) == 0;
     };
+
+    // fs::directory_iterator it("/usr/bin", fs::directory_options::skip_permission_denied, ec)
 
     if (command.find('/') != std::string::npos) {
         return executable(command) ? command : "";
@@ -342,6 +348,121 @@ std::vector<std::string> findBuiltinCompletions(const std::string &prefix)
 
     return matches;
 }
+
+std::vector<std::string> findExecutableCompletions(const std::string& prefix)
+{
+    namespace fs = std::filesystem;
+
+    //Match the builtins
+    std::vector<std::string> matches = findBuiltinCompletions(prefix);
+
+    //Read Path
+    const char* pathVariable = std::getenv("PATH");
+
+    if (!pathVariable)
+    {
+        std::sort(matches.begin(), matches.end());
+    
+        matches.erase(
+            std::unique(matches.begin(), matches.end()),
+            matches.end()
+        );
+    
+        return matches;
+    }
+    std::string pathText(pathVariable);
+
+    size_t start = 0;
+
+
+    //Visit each path directory
+    while(true)
+    {
+        size_t end = pathText.find(':', start);
+
+        std::string directory = pathText.substr(start, end == std::string::npos ? std::string::npos : end - start);
+
+        // Empty path components represent current directory
+        fs::path folder = directory.empty() ? fs::path(".") : fs::path(directory);
+
+        std::error_code directoryError;
+
+        fs::directiory_iterator it(folder, fs::directory_options:skip_permission_denied, directoryError);
+
+        fs::directory_iterator last;
+
+        while (!directoryError && it != last)
+        {
+            const fs::directory_entry& entry = *it;
+
+            std::string filename =
+                entry.path().filename().string();
+
+            // Step 5: Check prefix.
+            bool prefixMatches =
+                filename.rfind(prefix, 0) == 0;
+
+            if (prefixMatches)
+            {
+                std::error_code fileError;
+
+                // Step 6: Check executable status.
+                if (fs::is_regular_file(entry.path(), fileError) &&
+                    access(entry.path().c_str(), X_OK) == 0)
+                {
+                    matches.push_back(filename);
+                }
+            }
+
+            it.increment(directoryError);
+        
+        }
+        if(end == std:string::npos)
+            break;
+
+        start = end + 1;
+        
+    }
+
+    //Sort Alphabetically
+    std::sort(matches.begin(), matches.end());
+
+    //Remove repeated command names
+    matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
+
+    return matches;
+    
+}
+
+
+std::string longestCommonPrefix(const std::vector<std::string>& matches)
+{
+    if (matches.empty())
+        return "";
+
+    const std::string& first = matches[0];
+
+    size_t commonLength = first.size();
+
+    // Compare each matching name against the first.
+    for (size_t i = 1; i < matches.size(); ++i)
+    {
+        size_t j = 0;
+
+        while (j < commonLength && j < matches[i].size() && first[j] == matches[i][j])
+        {
+            ++j;
+        }
+
+        commonLength = j;
+
+        if (commonLength == 0)
+            break;
+    }
+
+    return first.substr(0, commonLength);
+}
+
 
 // Builtins run in the parent; always restore its standard descriptors afterward.
 class ScopedRedirections {
@@ -527,12 +648,18 @@ bool readInputLine(std::string& input)
     }
 
     input.clear();
+    bool previousTabWasAmbiguous = false;
 
     while(true)
     {
         char c = '\0';
 
         ssize_t bytes = read(STDIN_FILENO, &c, 1);
+
+        if (bytes == 0)
+        {
+            return !input.empty();
+        }
 
         if (bytes == -1)
         {
@@ -550,6 +677,7 @@ bool readInputLine(std::string& input)
 
         if(c == 127 || c == '\b')
         {
+            previousTabWasAmbiguous = false;
             if(!input.empty())
             {
                 input.pop_back();
@@ -566,24 +694,75 @@ bool readInputLine(std::string& input)
             if(input.empty() || input.find_first_of("\t") != std::string::npos)
             {
                 std::cout << '\a';
+                previousTabWasAmbiguous = false;
                 continue;
             }
 
-            /*When Tab arrives, we call:*/
-            auto matches = findBuiltinCompletions(input);
-
-            if(matches.size()==1)
+           // Search builtins and PATH executables.
+            std::vector<std::string> matches =
+                findExecutableCompletions(input);
+                
+            // CASE 1: No matches
+            if (matches.empty())
             {
-                /*If only one command matches, we calculate the characters that are missing.*/
-                std::string completion = matches[0].substr(input.size()) + " ";
-
+                std::cout << '\a';
+                previousTabWasAmbiguous = false;
+                continue;
+            }
+        
+            // CASE 2: Exactly one match
+            if (matches.size() == 1)
+            {
+                std::string completion =
+                    matches[0].substr(input.size()) + " ";
+            
                 input += completion;
                 std::cout << completion;
+            
+                previousTabWasAmbiguous = false;
+                continue;
             }
+        
+            // CASE 3: Multiple matches
+            std::string common = longestCommonPrefix(matches);
+        
+            // Check whether we can partially complete.
+            if (common.size() > input.size())
+            {
+                std::string suffix = common.substr(input.size());
+            
+                input += suffix;
+                std::cout << suffix;
+            
+                previousTabWasAmbiguous = false;
+                continue;
+            }
+        
+            // CASE 4: Multiple matches, no further common prefix
+        
+            // First Tab: Ring bell.
+            if (!previousTabWasAmbiguous)
+            {
+                std::cout << '\a';
+                previousTabWasAmbiguous = true;
+            }
+            // Second Tab: Show all candidates.
             else
             {
-                //No unique completion available;
-                std::cout << '\a';
+                std::cout << '\n';
+            
+                for (size_t i = 0; i < matches.size(); ++i)
+                {
+                    if (i > 0)
+                        std::cout << "  ";
+                
+                    std::cout << matches[i];
+                }
+            
+                // Redraw prompt and original input.
+                std::cout << "\n$ " << input;
+            
+                previousTabWasAmbiguous = false;
             }
             continue;
         }
@@ -596,6 +775,7 @@ bool readInputLine(std::string& input)
         //Ordinary printable input (byte-oriented)
         if(static_cast<unsigned char>(c) >= 32 && c != 127)
         {
+            previousTabWasAmbiguous = false;
             input.push_back(c);
             std::cout.put(c);
         }
