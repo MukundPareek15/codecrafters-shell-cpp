@@ -9,6 +9,141 @@
 #include <sys/wait.h>
 #include <cerrno>
 #include <cstdio>
+#include <cctype>
+#include <stdexcept>
+
+
+//Define the three states
+enum class QuoteMode
+{
+    Normal,
+    Single,
+    Double
+};
+
+std::vector<std::string> tokenize(const std::string &input)
+{
+    std::vector<std::string> tokens;
+
+    std::string currentToken;
+
+    QuoteMode mode = QuoteMode::Normal;
+
+    bool tokenStarted = false;
+
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        char c = input[i];
+
+        if (mode == QuoteMode::Normal)
+        {
+            if(std::isspace(static_cast<unsigned char>)(c))
+            {
+                if (tokenStarted)
+                {
+                    tokens.push_back(currentToken);
+                    currentToken.clear();
+                    tokenStarted = false;
+                }
+            }
+
+            else if (c == '\'')
+            {
+                mode = QuoteMode::Single;
+                tokenStarted = true;
+            }
+
+            else if (c == '"')
+            {
+                mode = QuoteMode::Double;
+                tokenStarted = true;
+            }
+
+            else if (c == '\\')
+            {
+                if (i + 1 >= input.size())
+                {
+                    throw std::runtime_error("Incomplete escape");
+                }
+            
+                char next = input[++i];
+            
+                if (next != '\n')
+                {
+                    currentToken.push_back(next);
+                    tokenStarted = true;
+                }
+            }
+
+            else 
+            {
+                currentToken.push_back(c);
+                tokenStarted = true;
+            }
+        }
+        else if (mode == QuoteMode::Single)
+        {
+            if (c == '\'')
+            {
+                mode = QuoteMode::Normal;
+            }
+            else
+            {
+                currentToken.push_back(c);
+            }
+        }
+        else if (mode == QuoteMode::Double)
+        {
+            if (c == '"')
+            {
+                mode = QuoteMode::Normal;
+            }
+            else if (c == '\\')
+            {
+                if (i + 1 >= input.size())
+                {
+                    throw std::runtime_error("Incomplete escape");
+                }
+            
+                char next = input[i + 1];
+            
+                if (next == '$' ||
+                    next == '`' ||
+                    next == '"' ||
+                    next == '\\')
+                {
+                    currentToken.push_back(next);
+                    ++i;
+                }
+                else if (next == '\n')
+                {
+                    ++i;
+                }
+                else
+                {
+                    currentToken.push_back('\\');
+                }
+            }
+
+            else
+            {
+                currentToken.push_back(c);
+            }
+        }
+    }
+
+    if(mode != QuoteMode::Normal)
+    {
+        throw std::runtime_error("Unclosed quote");
+    }
+
+    if(tokenStarted)
+    {
+        tokens.push_back(currentToken);
+    }
+    
+    return tokens;
+}
 
 // Find an executable using PATH or an explicit file path.
 std::string findExecutable(const std::string& command)
@@ -60,31 +195,31 @@ int main()
 
         std::string input;
 
-        std::vector<std::string> tokenize(const std::string& input);
-
         if (!std::getline(std::cin, input))
         {
             break;
         }
 
-        // Parse command and arguments
-        std::istringstream stream(input);
+        syd::vector<std::string> tokens;
 
-        std::string command;
-        stream >> command;
+        try
+        {
+            tokens = tokenize(input);
+        }
+        catch (std::runtime_error& error)
+        {
+            std::cerr << "Error: " <<error.what() << std::endl;
+            continue;
+        }
 
-        if (command.empty())
+        if (tokens.empty())
         {
             continue;
         }
 
-        std::vector<std::string> arguments;
-        std::string arg;
+        std::string command = tokens[0];
 
-        while (stream >> arg)
-        {
-            arguments.push_back(arg);
-        }
+        std::vector<std::string> arguments(tokens.begin() + 1, tokens.end());
 
         // Builtin: exit
         if (command == "exit")
