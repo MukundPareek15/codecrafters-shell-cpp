@@ -13,13 +13,41 @@
 #include <cctype>
 #include <stdexcept>
 
-
 //Define the three states
 enum class QuoteMode
 {
     Normal,
     Single,
     Double
+};
+
+enum class TokenType
+{
+    Word,
+    RedirectOut,
+    RedirectAppend,
+    RedirectError,
+    RedirectErrorAppend,
+    RedirectInput,
+};
+
+struct Token
+{
+    TokenType type;
+    std::string value;
+};
+
+struct Redirection
+{
+    int targetFd;
+    std::string filename;
+    bool append;
+};
+
+struct ParsedCommand
+{
+    std::vector<std::string> arguments;
+    std::vector<Redirection> redirections;
 };
 
 std::vector<std::string> tokenize(const std::string &input)
