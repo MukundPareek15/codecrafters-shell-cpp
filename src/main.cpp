@@ -200,7 +200,7 @@ int main()
             break;
         }
 
-        syd::vector<std::string> tokens;
+        std::vector<std::string> tokens;
 
         try
         {
