@@ -58,7 +58,7 @@ int main()
     {
         std::cout << "$ ";
 
-        // std::string input;
+        std::string input;
 
         std::vector<std::string> tokenize(const std::string& input);
 
