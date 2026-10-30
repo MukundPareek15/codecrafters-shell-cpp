@@ -51,11 +51,13 @@ class TerminalModeGuard
 public:
     TerminalModeGuard()
     {
-        if (!issatty(STDIN_FILENO)) 
+        if (!isatty(STDIN_FILENO)) 
             return;
 
         if (tcgetattr(STDIN_FILENO, &original_) == -1)
             return;
+
+        termios settings = original_;
 
         //Disable canonical mode and echoing
         settings.c_lflag &= ~(ICANON | ECHO);
@@ -581,7 +583,7 @@ bool readInputLine(std::string& input)
             else
             {
                 //No unique completion available;
-                std::cout << '\a'
+                std::cout << '\a';
             }
             continue;
         }
