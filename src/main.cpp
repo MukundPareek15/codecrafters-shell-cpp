@@ -1,5 +1,8 @@
-// Our own personal Shell implementation. It supports a small subset of POSIX shell features, including:
-// - Running external commands with arguments.
+// CodeCrafters Shell implementation (C++17, POSIX).
+// Builtins: exit, echo, pwd, cd, type.
+// Features: quoting, PATH lookup, external execution, redirection,
+// command completion, file/directory completion, multiple and partial matches.
+// Character-by-character editing is supported when stdin is a terminal.
 
 #include <cerrno>
 #include <cctype>
@@ -15,6 +18,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+#include <system_error>
+#include <utility>
 
 enum class QuoteMode { Normal, Single, Double };
 
@@ -28,12 +33,39 @@ enum class TokenType {
     RedirectErrorToOut
 };
 
+enum class RedirectionMode { Truncate, Append, Read, Duplicate };
+
 struct Token {
     TokenType type;
     std::string value;
 };
 
-enum class RedirectionMode { Truncate, Append, Read, Duplicate };
+struct CompletionContext
+{
+    bool isCommand = true;
+    std::string prefix;        // Current argument, with quoting/escaping decoded
+    std::string commandName;   // First completed word, when completing an argument
+    QuoteMode quoteMode = QuoteMode::Normal;
+};
+
+struct CompletionCandidate
+{
+    std::string text;
+    bool appendSpace;
+};
+
+struct FilenameMatch
+{
+    std::string replacement;
+    bool isDirectory;
+};
+
+struct PathCompletionContext
+{
+    std::filesystem::path directory;
+    std::string directoryPrefix;
+    std::string filenamePrefix;
+};
 
 struct Redirection {
     int targetFd = -1;
@@ -85,6 +117,195 @@ private:
     termios original_{};
     bool active_ = false;
 };
+
+// Completion operates on an unfinished input line. Unlike tokenize(), this scanner
+// permits unclosed quotes. It finds the active word and decodes quoted spaces.
+CompletionContext getCompletionContext(const std::string& input)
+{
+    std::vector<std::string> completedWords;
+    std::string current;
+    QuoteMode mode = QuoteMode::Normal;
+    bool wordStarted = false;
+
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        char c = input[i];
+
+        if (mode == QuoteMode::Single)
+        {
+            if (c == '\'')
+                mode = QuoteMode::Normal;
+            else
+                current.push_back(c);
+            continue;
+        }
+
+        if (mode == QuoteMode::Double)
+        {
+            if (c == '"')
+                mode = QuoteMode::Normal;
+            else if (c == '\\' && i + 1 < input.size())
+            {
+                char next = input[i + 1];
+                if (next == '$' || next == '`' || next == '"' || next == '\\')
+                {
+                    current.push_back(next);
+                    ++i;
+                }
+                else if (next == '\n')
+                    ++i;
+                else
+                    current.push_back('\\');
+            }
+            else
+                current.push_back(c);
+            continue;
+        }
+
+        if (std::isspace(static_cast<unsigned char>(c)))
+        {
+            if (wordStarted)
+            {
+                completedWords.push_back(current);
+                current.clear();
+                wordStarted = false;
+            }
+        }
+        else if (c == '\'' || c == '"')
+        {
+            mode = (c == '\'') ? QuoteMode::Single : QuoteMode::Double;
+            wordStarted = true;
+        }
+        else if (c == '\\' && i + 1 < input.size())
+        {
+            char next = input[++i];
+            if (next != '\n')
+            {
+                current.push_back(next);
+                wordStarted = true;
+            }
+        }
+        else
+        {
+            current.push_back(c);
+            wordStarted = true;
+        }
+    }
+
+    CompletionContext result;
+    result.isCommand = completedWords.empty();
+    result.commandName = completedWords.empty() ? "" : completedWords.front();
+    result.prefix = current;
+    result.quoteMode = mode;
+    return result;
+}
+
+PathCompletionContext splitPathForCompletion(const std::string& fragment)
+{
+    size_t slash = fragment.find_last_of('/');
+    if (slash == std::string::npos)
+        return {".", "", fragment};
+
+    std::string directoryPrefix = fragment.substr(0, slash + 1);
+    return {
+        std::filesystem::path(directoryPrefix),
+        directoryPrefix,
+        fragment.substr(slash + 1)
+    };
+}
+
+// Make the newly inserted characters valid shell input in the current quote mode.
+std::string escapeCompletionSuffix(const std::string& suffix, QuoteMode mode)
+{
+    std::string escaped;
+    for (char c : suffix)
+    {
+        if (mode == QuoteMode::Single)
+        {
+            if (c == '\'')
+                escaped += "'\\''"; // End quote, escape quote, reopen quote.
+            else
+                escaped.push_back(c);
+        }
+        else if (mode == QuoteMode::Double)
+        {
+            if (c == '"' || c == '\\' || c == '$' || c == '`')
+                escaped.push_back('\\');
+            escaped.push_back(c);
+        }
+        else
+        {
+            if (std::isspace(static_cast<unsigned char>(c)) ||
+                c == '\\' || c == '\'' || c == '"' || c == '>' ||
+                c == '<' || c == '|' || c == '&' || c == ';' ||
+                c == '(' || c == ')' || c == '$' || c == '`' ||
+                c == '*' || c == '?' || c == '[' || c == ']')
+                escaped.push_back('\\');
+            escaped.push_back(c);
+        }
+    }
+    return escaped;
+}
+
+std::vector<FilenameMatch> findFilenameCompletions(const std::string& fragment, bool directoriesOnly = false)
+{
+    namespace fs = std::filesystem;
+
+    std::vector<FilenameMatch> matches;
+
+    PathCompletionContext context = splitPathForCompletion(fragment);
+
+    std::error_code ec;
+
+    fs::directory_iterator it(context.directory, fs::directory_options::skip_permission_denied, ec);
+
+    fs::directory_iterator end;
+
+    while (!ec && it != end)
+    {
+        const fs::directory_entry& entry = *it;
+
+        std::string name = entry.path().filename().string();
+
+        // Check whether the name matches the typed prefix.
+        bool startsWithPrefix = name.rfind(context.filenamePrefix, 0) == 0;
+
+        // Hide dotfiles unless the user starts with a dot.
+        bool hidden = !name.empty() && name[0] == '.';
+
+        bool includeHidden = !context.filenamePrefix.empty() && context.filenamePrefix[0] == '.';
+
+        if (startsWithPrefix && (!hidden || includeHidden))
+        {
+            std::error_code typeError;
+            bool isDirectory = entry.is_directory(typeError);
+
+            if (!typeError && (!directoriesOnly || isDirectory))
+            {
+                std::string replacement = context.directoryPrefix + name;
+
+                if (isDirectory)
+                    replacement += "/";
+
+                matches.push_back({replacement, isDirectory});
+            }
+        }
+
+        it.increment(ec);
+    }
+
+    std::sort(
+        matches.begin(),
+        matches.end(),
+        [](const FilenameMatch& a, const FilenameMatch& b)
+        {
+            return a.replacement < b.replacement;
+        }
+    );
+
+    return matches;
+}
+
 
 // Separate shell operators from words without interpreting quoted characters as operators.
 std::vector<Token> tokenize(const std::string& input) {
@@ -252,16 +473,11 @@ bool isBuiltin(const std::string& name) {
 std::string findExecutable(const std::string& command) {
     namespace fs = std::filesystem;
 
-    /*Not sure if this'll come in use later or be an issue, so commenting at the moment*/
-    // std::error_code ec;
-
     auto executable = [](const fs::path& path) {
         std::error_code error;
         return fs::is_regular_file(path, error) &&
                access(path.c_str(), X_OK) == 0;
     };
-
-    // fs::directory_iterator it("/usr/bin", fs::directory_options::skip_permission_denied, ec)
 
     if (command.find('/') != std::string::npos) {
         return executable(command) ? command : "";
@@ -525,7 +741,7 @@ private:
     }
 };
 
-// Return a shell exit code for exit. Other builtins leave the loop running.
+// Execute builtins other than exit, which is handled by main().
 int executeBuiltin(const std::vector<std::string>& args) {
     const std::string& command = args[0];
 
@@ -686,82 +902,102 @@ bool readInputLine(std::string& input)
             continue;
         }
 
-        //TAB
-        /*\t represents the Tab character, byte value 9 in ASCII.*/
+        // TAB: command-name completion or filename/directory completion.
         if (c == '\t')
         {
-            // For now we complete only the command word
-            if(input.empty() || input.find_first_of("\t") != std::string::npos)
+            CompletionContext context = getCompletionContext(input);
+            std::vector<CompletionCandidate> candidates;
+
+            if (context.isCommand)
+            {
+                if (context.prefix.find('/') == std::string::npos)
+                {
+                    // Bare command names come from builtins and PATH.
+                    for (const auto& name : findExecutableCompletions(context.prefix))
+                        candidates.push_back({name, true});
+                }
+                else
+                {
+                    // A command containing '/' is a path, not a PATH lookup.
+                    for (const auto& match : findFilenameCompletions(context.prefix))
+                    {
+                        std::error_code ec;
+                        bool executable = std::filesystem::is_regular_file(match.replacement, ec) &&
+                                          access(match.replacement.c_str(), X_OK) == 0;
+                        if (match.isDirectory || executable)
+                            candidates.push_back({match.replacement, !match.isDirectory});
+                    }
+                }
+            }
+            else
+            {
+                bool directoriesOnly = (context.commandName == "cd");
+                for (const auto& match : findFilenameCompletions(context.prefix, directoriesOnly))
+                    candidates.push_back({match.replacement, !match.isDirectory});
+            }
+
+            if (candidates.empty())
             {
                 std::cout << '\a';
                 previousTabWasAmbiguous = false;
                 continue;
             }
 
-           // Search builtins and PATH executables.
-            std::vector<std::string> matches =
-                findExecutableCompletions(input);
-                
-            // CASE 1: No matches
-            if (matches.empty())
+            // One match: insert the remainder, then '/' for directories or
+            // a closing quote and space for completed quoted filenames.
+            if (candidates.size() == 1)
             {
-                std::cout << '\a';
+                const auto& candidate = candidates.front();
+                const std::string suffix = candidate.text.substr(context.prefix.size());
+                std::string inserted = escapeCompletionSuffix(suffix, context.quoteMode);
+
+                if (candidate.appendSpace)
+                {
+                    if (context.quoteMode == QuoteMode::Single)
+                        inserted += '\'';
+                    else if (context.quoteMode == QuoteMode::Double)
+                        inserted += '"';
+                    inserted += ' ';
+                }
+
+                input += inserted;
+                std::cout << inserted;
                 previousTabWasAmbiguous = false;
                 continue;
             }
-        
-            // CASE 2: Exactly one match
-            if (matches.size() == 1)
+
+            std::vector<std::string> names;
+            names.reserve(candidates.size());
+            for (const auto& candidate : candidates)
+                names.push_back(candidate.text);
+
+            // Several matches may still share more characters than typed.
+            const std::string common = longestCommonPrefix(names);
+            if (common.size() > context.prefix.size())
             {
-                std::string completion =
-                    matches[0].substr(input.size()) + " ";
-            
-                input += completion;
-                std::cout << completion;
-            
+                std::string inserted = escapeCompletionSuffix(
+                    common.substr(context.prefix.size()), context.quoteMode);
+                input += inserted;
+                std::cout << inserted;
                 previousTabWasAmbiguous = false;
                 continue;
             }
-        
-            // CASE 3: Multiple matches
-            std::string common = longestCommonPrefix(matches);
-        
-            // Check whether we can partially complete.
-            if (common.size() > input.size())
-            {
-                std::string suffix = common.substr(input.size());
-            
-                input += suffix;
-                std::cout << suffix;
-            
-                previousTabWasAmbiguous = false;
-                continue;
-            }
-        
-            // CASE 4: Multiple matches, no further common prefix
-        
-            // First Tab: Ring bell.
+
             if (!previousTabWasAmbiguous)
             {
                 std::cout << '\a';
                 previousTabWasAmbiguous = true;
             }
-            // Second Tab: Show all candidates.
             else
             {
                 std::cout << '\n';
-            
-                for (size_t i = 0; i < matches.size(); ++i)
+                for (size_t i = 0; i < names.size(); ++i)
                 {
                     if (i > 0)
                         std::cout << "  ";
-                
-                    std::cout << matches[i];
+                    std::cout << names[i];
                 }
-            
-                // Redraw prompt and original input.
                 std::cout << "\n$ " << input;
-            
                 previousTabWasAmbiguous = false;
             }
             continue;
