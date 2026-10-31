@@ -1,1023 +1,1447 @@
-// CodeCrafters Shell, extended C++17 POSIX implementation.
-// Features: quoting, variable expansion, redirections, pipelines, background jobs,
-// history and persistence, filename/command/programmable completion.
-// Build: g++ -std=c++17 -Wall -Wextra -Wpedantic -O2 app/main.cpp -o shell
-// Designed for Unix-like environments, including Linux, macOS, and WSL.
-#include <algorithm>
-#include <cerrno>
-#include <cctype>
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fcntl.h>
-#include <fstream>
-#include <iomanip>
-#include <iostream>
-#include <map>
-#include <optional>
-#include <sstream>
-#include <stdexcept>
+// =============================================================================
+// CodeCrafters Shell implementation (C++, POSIX only).
+// =============================================================================
+// Builtins: exit, echo, pwd, cd, type.
+// Features: quoting, PATH lookup, external execution, redirection,
+// command completion, file/directory completion, multiple and partial matches.
+// Character-by-character editing is supported when stdin is a terminal.
+//
+// HOW A COMMAND FLOWS THROUGH THIS FILE
+//   main()                      REPL loop: print "$ ", read, run, repeat.
+//    └─ readInputLine()         Reads one line (raw terminal mode + TAB completion).
+//    └─ tokenize()              Text -> Tokens (words and redirection operators).
+//    └─ parseCommand()          Tokens -> ParsedCommand (argv + redirection list).
+//    └─ executeBuiltin()        Runs echo/pwd/cd/type inside this process, or
+//       executeExternal()       fork() + execv() a program found on PATH.
+//
+// POINTS TO NOTE
+//  * The header comment used to say C++17; CMakeLists.txt actually builds with
+//    CMAKE_CXX_STANDARD 23. Nothing here needs more than C++17 (std::filesystem).
+//  * This uses POSIX-only headers (<termios.h>, <unistd.h>, <sys/wait.h>), so it
+//    builds on Linux/macOS/WSL, not natively on Windows with MSVC.
+//  * Not supported (yet): pipes '|', variables '$X', globbing '*', '&&', ';',
+//    background jobs '&', and the '$?' last-exit-status variable.
+// =============================================================================
+
+#include <cerrno>        // errno, EINTR
+#include <cctype>        // std::isspace
+#include <cstdio>        // perror
+#include <cstdlib>       // std::getenv, std::atoi
+#include <filesystem>    // std::filesystem::path, directory_iterator, current_path
+#include <fcntl.h>       // open() and its O_* flags
+#include <iostream>      // std::cout, std::cerr, std::cin
+#include <stdexcept>     // std::runtime_error (used for parse errors)
+#include <algorithm>     // std::sort, std::unique
 #include <string>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <termios.h>
-#include <unistd.h>
-#include <unordered_map>
-#include <utility>
+#include <termios.h>     // tcgetattr/tcsetattr: switch the terminal to raw-ish mode
+#include <sys/wait.h>    // waitpid and the WIFEXITED/WEXITSTATUS macros
+#include <unistd.h>      // fork, execv, dup, dup2, close, read, access, isatty
 #include <vector>
+#include <system_error>  // std::error_code (non-throwing filesystem calls)
+#include <utility>       // std::move
 
-namespace fs = std::filesystem;
+// =============================================================================
+// Core data types
+// =============================================================================
 
+// Which kind of quote the scanner is currently inside. Quoting changes how
+// every following character is interpreted until the matching quote closes.
+//   Normal : spaces split words, '\' escapes the next char, > and < are operators.
+//   Single : everything is literal until the next '  (no escapes at all).
+//   Double : literal except  \$  \`  \"  \\  and backslash-newline.
 enum class QuoteMode { Normal, Single, Double };
-enum class TokenKind { Word, Pipe, Background, RedirOut, RedirAppend, RedirErr,
-                       RedirErrAppend, RedirIn, ErrToOut };
-enum class RedirectMode { Truncate, Append, Read, Dup };
-struct Token { TokenKind kind; std::string value; };
+
+// What the tokenizer can produce. Everything that is not an operator is a Word.
+//   RedirectOut          >   or 1>    stdout -> file (truncate)
+//   RedirectAppend       >>  or 1>>   stdout -> file (append)
+//   RedirectError        2>           stderr -> file (truncate)
+//   RedirectErrorAppend  2>>          stderr -> file (append)
+//   RedirectInput        <            file  -> stdin
+//   RedirectErrorToOut   2>&1         stderr -> wherever stdout points right now
+enum class TokenType 
+{
+    Word,
+    RedirectOut,
+    RedirectAppend,
+    RedirectError,
+    RedirectErrorAppend,
+    RedirectInput,
+    RedirectErrorToOut
+};
+
+// How a redirection opens its target:
+//   Truncate  -> O_TRUNC  (empty the file first)
+//   Append    -> O_APPEND (every write goes to the end of the file)
+//   Read      -> O_RDONLY (for '<')
+//   Duplicate -> no file; copy one descriptor onto another (for 2>&1)
+enum class RedirectionMode { Truncate, Append, Read, Duplicate };
+
+// One lexical unit. `value` is the *decoded* text: quotes and escapes have
+// already been removed, so  'a b'  becomes the single word  a b.
+struct Token {
+    TokenType type;
+    std::string value;
+};
+
+// Snapshot of the half-typed line at the moment TAB is pressed.
+struct CompletionContext
+{
+    bool isCommand = true;     // true while typing the first word (the command name)
+    std::string prefix;        // Current argument, with quoting/escaping decoded
+    std::string commandName;   // First completed word, when completing an argument
+    QuoteMode quoteMode = QuoteMode::Normal;  // Is the word inside an open quote?
+};
+
+// One possible completion shown to / inserted for the user.
+struct CompletionCandidate
+{
+    std::string text;          // Full decoded word, e.g. "src/main.cpp" or "echo"
+    bool appendSpace;          // true for "finished" words; false for directories,
+                               // so the user can keep typing after the '/'
+};
+
+// A filesystem entry that matched during path completion.
+struct FilenameMatch
+{
+    std::string replacement;   // Directory part + name (+ '/' if it's a directory)
+    bool isDirectory;
+};
+
+// A partially typed path split at the last '/':
+//   "src/ma" -> directory "src/", directoryPrefix "src/", filenamePrefix "ma"
+//   "ma"     -> directory ".",    directoryPrefix "",     filenamePrefix "ma"
+struct PathCompletionContext
+{
+    std::filesystem::path directory;   // Where to list entries
+    std::string directoryPrefix;       // Text to keep in front of each match
+    std::string filenamePrefix;        // What each entry name must start with
+};
+
+// One redirection, ready to be applied with open()/dup2().
+//   targetFd : the descriptor being replaced (0 = stdin, 1 = stdout, 2 = stderr)
+//   filename : file to open (unused for Duplicate)
+//   sourceFd : descriptor to copy from (only used for Duplicate, i.e. 2>&1)
 struct Redirection {
-    int target = 1;
-    RedirectMode mode = RedirectMode::Truncate;
+    int targetFd = -1;
+    RedirectionMode mode = RedirectionMode::Truncate;
     std::string filename;
-    int source = -1;
-};
-struct Command { std::vector<std::string> args; std::vector<Redirection> redirects; };
-struct Pipeline { std::vector<Command> commands; bool background = false; };
-struct Job {
-    int number = 0;
-    size_t launchOrder = 0;
-    std::vector<pid_t> pids;
-    std::vector<bool> finished;
-    std::string text;
-    bool notified = false;
-};
-struct ShellState {
-    std::unordered_map<std::string, std::string> variables;
-    std::map<std::string, std::string> completions;
-    std::vector<std::string> history;
-    size_t historyFlushed = 0;
-    std::vector<Job> jobs;
-    size_t nextLaunchOrder = 1;
-    bool historyAppendOnExit = false;
-    int lastStatus = 0;
-    bool shouldExit = false;
-    int exitCode = 0;
+    int sourceFd = -1;
 };
 
-bool nameStart(char c) { return std::isalpha(static_cast<unsigned char>(c)) || c == '_'; }
-bool nameChar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
-bool validName(const std::string& s) {
-    if (s.empty() || !nameStart(s[0])) return false;
-    return std::all_of(s.begin() + 1, s.end(), nameChar);
-}
-std::string variableValue(const std::string& name, const ShellState& state) {
-    if (name == "?") return std::to_string(state.lastStatus);
-    if (name == "$") return std::to_string(static_cast<long>(getpid()));
-    if (const auto it = state.variables.find(name); it != state.variables.end()) return it->second;
-    if (const char* p = std::getenv(name.c_str())) return p;
-    return "";
+// The result of parsing one input line.
+// `arguments` is argv: arguments[0] is the command name.
+// `redirections` keeps the order they were written in. Order matters:
+//   cmd > f 2>&1   sends both streams to f
+//   cmd 2>&1 > f   sends stderr to the terminal, only stdout to f
+struct ParsedCommand {
+    std::vector<std::string> arguments;
+    std::vector<Redirection> redirections;
+};
+
+// =============================================================================
+// Terminal handling
+// =============================================================================
+
+// RAII guard that puts the terminal into non-canonical, no-echo mode and puts
+// the original settings back when the guard goes out of scope.
+//
+// Why: By default the terminal driver is in "canonical" (cooked) mode. It
+// buffers a whole line, handles Backspace by itself, and only hands the program
+// the text after Enter. To react to TAB immediately and draw our own echo, we
+// have to receive every keystroke as it's typed.
+//
+// Points to note:
+//  * If stdin is not a terminal (piped input, tests, `./shell < script`),
+//    nothing is changed and active() returns false.
+//  * Only ICANON and ECHO are turned off. ISIG stays on, so Ctrl+C still sends
+//    SIGINT. Because the shell installs no handler, Ctrl+C kills the shell, and
+//    the destructor does NOT run on death by signal. The terminal can then be
+//    left without echo; type `reset` or `stty sane` blindly to fix it.
+//  * In non-canonical mode the special keys are no longer interpreted:
+//    Ctrl+D arrives as byte 4 and Backspace usually as byte 127 (DEL).
+//    readInputLine() handles both by hand.
+class TerminalModeGuard
+{
+public:
+    TerminalModeGuard()
+    {
+        if (!isatty(STDIN_FILENO))
+            return;
+
+        // Save the current settings so the destructor can put them back.
+        if (tcgetattr(STDIN_FILENO, &original_) == -1)
+            return;
+
+        termios settings = original_;
+
+        //Disable canonical mode and echoing
+        // c_lflag holds the "local" flags. Clear the two bits and leave the rest alone.
+        settings.c_lflag &= ~(ICANON | ECHO);
+
+        //Return after one character
+        // VMIN = 1, VTIME = 0: read() blocks until at least 1 byte is available,
+        // with no timeout.
+        settings.c_cc[VMIN] = 1;
+        settings.c_cc[VTIME] = 0;
+
+        // TCSANOW applies the change immediately (not after output drains).
+        active_ = tcsetattr(STDIN_FILENO, TCSANOW, &settings) == 0;
+
+    }
+
+    ~TerminalModeGuard()
+    {
+        if (active_)
+        {
+            tcsetattr(STDIN_FILENO, TCSANOW, &original_);
+        }
+    }
+
+    bool active () const { return active_; }
+
+private:
+    termios original_{};   // Settings in effect before we touched anything
+    bool active_ = false;  // true only if we actually changed the terminal
+};
+
+// =============================================================================
+// Tab completion helpers
+// =============================================================================
+
+// Completion operates on an unfinished input line. Unlike tokenize(), this scanner
+// permits unclosed quotes. It finds the active word and decodes quoted spaces.
+//
+// Example: input = `cat "my fi`
+//   completedWords = {"cat"}, prefix = "my fi", quoteMode = Double
+//   -> isCommand = false, commandName = "cat"
+//
+// Point to note: this scanner does not know about > or <, so in `echo hi>ou`
+// the active word is "hi>ou". With spaces (`echo hi > ou`) it works as expected.
+CompletionContext getCompletionContext(const std::string& input)
+{
+    std::vector<std::string> completedWords;  // Words already closed by whitespace
+    std::string current;                      // The word under the cursor (decoded)
+    QuoteMode mode = QuoteMode::Normal;
+    bool wordStarted = false;  // Needed because "" is a real (empty) word
+
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+        char c = input[i];
+
+        // Inside '...': every character is literal until the closing quote.
+        if (mode == QuoteMode::Single)
+        {
+            if (c == '\'')
+                mode = QuoteMode::Normal;
+            else
+                current.push_back(c);
+            continue;
+        }
+
+        // Inside "...": a backslash escapes only $ ` " \ and newline (POSIX rule).
+        // Any other backslash is kept literally, e.g. "a\b" stays a\b.
+        if (mode == QuoteMode::Double)
+        {
+            if (c == '"')
+                mode = QuoteMode::Normal;
+            else if (c == '\\' && i + 1 < input.size())
+            {
+                char next = input[i + 1];
+                if (next == '$' || next == '`' || next == '"' || next == '\\')
+                {
+                    current.push_back(next);
+                    ++i;
+                }
+                else if (next == '\n')
+                    ++i;          // backslash-newline = line continuation, drop both
+                else
+                    current.push_back('\\');
+            }
+            else
+                current.push_back(c);
+            continue;
+        }
+
+        // Normal (unquoted) mode.
+        // The cast to unsigned char matters: passing a negative char (any byte
+        // >= 0x80, e.g. UTF-8) to std::isspace is undefined behaviour.
+        if (std::isspace(static_cast<unsigned char>(c)))
+        {
+            if (wordStarted)
+            {
+                completedWords.push_back(current);
+                current.clear();
+                wordStarted = false;
+            }
+        }
+        else if (c == '\'' || c == '"')
+        {
+            // Quotes don't end a word: a"b c"d is the single word "ab cd".
+            mode = (c == '\'') ? QuoteMode::Single : QuoteMode::Double;
+            wordStarted = true;
+        }
+        else if (c == '\\' && i + 1 < input.size())
+        {
+            // Unquoted backslash: the next character is taken literally.
+            char next = input[++i];
+            if (next != '\n')
+            {
+                current.push_back(next);
+                wordStarted = true;
+            }
+        }
+        else
+        {
+            // Ordinary character. A trailing lone '\' also lands here and is kept as-is.
+            current.push_back(c);
+            wordStarted = true;
+        }
+    }
+
+    // Whatever is still in `current` is the word the cursor is on.
+    // If nothing has been completed yet, that word is the command name.
+    CompletionContext result;
+    result.isCommand = completedWords.empty();
+    result.commandName = completedWords.empty() ? "" : completedWords.front();
+    result.prefix = current;
+    result.quoteMode = mode;
+    return result;
 }
 
-// Expand a parameter starting at $, returning false if it is not a supported parameter.
-bool consumeParameter(const std::string& line, size_t& i, const ShellState& state,
-                      std::string& expanded) {
-    if (i + 1 >= line.size()) return false;
-    size_t end = i + 1;
-    std::string name;
-    if (line[end] == '{') {
-        size_t close = line.find('}', end + 1);
-        if (close == std::string::npos) throw std::runtime_error("bad substitution");
-        name = line.substr(end + 1, close - end - 1);
-        if (!validName(name) && name != "?" && name != "$")
-            throw std::runtime_error("bad substitution");
-        i = close;
-    } else if (line[end] == '?' || line[end] == '$') {
-        name = line[end]; i = end;
-    } else if (nameStart(line[end])) {
-        size_t begin = end;
-        while (end < line.size() && nameChar(line[end])) ++end;
-        name = line.substr(begin, end - begin);
-        i = end - 1;
-    } else return false;
-    expanded = variableValue(name, state);
-    return true;
+// Split a partially typed path into "which directory to list" and
+// "what the entry name must start with". See PathCompletionContext.
+// Works for absolute paths too: "/us" -> directory "/", filenamePrefix "us".
+PathCompletionContext splitPathForCompletion(const std::string& fragment)
+{
+    size_t slash = fragment.find_last_of('/');
+    if (slash == std::string::npos)
+        return {".", "", fragment};   // No slash: look in the current directory
+
+    // Keep the trailing '/' in the prefix so it can be prepended to each match.
+    std::string directoryPrefix = fragment.substr(0, slash + 1);
+    return {
+        std::filesystem::path(directoryPrefix),
+        directoryPrefix,
+        fragment.substr(slash + 1)
+    };
 }
 
-// Lex commands and operators while applying quote-aware variable substitution.
-std::vector<Token> lex(const std::string& line, const ShellState& state) {
+// Make the newly inserted characters valid shell input in the current quote mode.
+//
+// Completion works on *decoded* text (e.g. the file `my file.txt`), but what we
+// insert into the line has to re-parse to the same text, so we re-encode it:
+//   Normal : my\ file.txt      (escape spaces and shell metacharacters)
+//   Double : "my file.txt      (only " \ $ ` need a backslash)
+//   Single : 'my file.txt      (nothing can be escaped inside '...')
+std::string escapeCompletionSuffix(const std::string& suffix, QuoteMode mode)
+{
+    std::string escaped;
+    for (char c : suffix)
+    {
+        if (mode == QuoteMode::Single)
+        {
+            // A single quote can't appear inside '...', so close the quote,
+            // add an escaped quote, then reopen:  'it'\''s'  ->  it's
+            if (c == '\'')
+                escaped += "'\\''"; // End quote, escape quote, reopen quote.
+            else
+                escaped.push_back(c);
+        }
+        else if (mode == QuoteMode::Double)
+        {
+            if (c == '"' || c == '\\' || c == '$' || c == '`')
+                escaped.push_back('\\');
+            escaped.push_back(c);
+        }
+        else
+        {
+            // Unquoted: escape whitespace and every character a POSIX shell treats
+            // as special. Some of these (| & ; * ...) aren't implemented by this
+            // shell yet, but escaping them keeps the line correct in a real shell too.
+            if (std::isspace(static_cast<unsigned char>(c)) ||
+                c == '\\' || c == '\'' || c == '"' || c == '>' ||
+                c == '<' || c == '|' || c == '&' || c == ';' ||
+                c == '(' || c == ')' || c == '$' || c == '`' ||
+                c == '*' || c == '?' || c == '[' || c == ']')
+                escaped.push_back('\\');
+            escaped.push_back(c);
+        }
+    }
+    return escaped;
+}
+
+// List the files/directories that could complete `fragment`, sorted by name.
+// With directoriesOnly = true (used for `cd`), regular files are skipped.
+std::vector<FilenameMatch> findFilenameCompletions(const std::string& fragment, bool directoriesOnly = false)
+{
+    namespace fs = std::filesystem;
+
+    std::vector<FilenameMatch> matches;
+
+    PathCompletionContext context = splitPathForCompletion(fragment);
+
+    // The std::error_code overloads don't throw. A missing or unreadable
+    // directory just sets `ec`, the loop never starts, and we return no matches
+    // instead of crashing.
+    std::error_code ec;
+
+    fs::directory_iterator it(context.directory, fs::directory_options::skip_permission_denied, ec);
+
+    // A default-constructed directory_iterator is the "end" sentinel.
+    fs::directory_iterator end;
+
+    while (!ec && it != end)
+    {
+        const fs::directory_entry& entry = *it;
+
+        std::string name = entry.path().filename().string();
+
+        // Check whether the name matches the typed prefix.
+        // `rfind(prefix, 0) == 0` is the pre-C++20 idiom for starts_with:
+        // it only searches at position 0.
+        bool startsWithPrefix = name.rfind(context.filenamePrefix, 0) == 0;
+
+        // Hide dotfiles unless the user starts with a dot.
+        bool hidden = !name.empty() && name[0] == '.';
+
+        bool includeHidden = !context.filenamePrefix.empty() && context.filenamePrefix[0] == '.';
+
+        if (startsWithPrefix && (!hidden || includeHidden))
+        {
+            // is_directory() follows symlinks, so a link to a directory
+            // completes with a trailing '/' as well.
+            std::error_code typeError;
+            bool isDirectory = entry.is_directory(typeError);
+
+            if (!typeError && (!directoriesOnly || isDirectory))
+            {
+                std::string replacement = context.directoryPrefix + name;
+
+                if (isDirectory)
+                    replacement += "/";
+
+                matches.push_back({replacement, isDirectory});
+            }
+        }
+
+        // increment(ec) is the non-throwing version of ++it.
+        it.increment(ec);
+    }
+
+    // directory_iterator returns entries in no particular order, so sort them
+    // for stable, predictable output.
+    std::sort(
+        matches.begin(),
+        matches.end(),
+        [](const FilenameMatch& a, const FilenameMatch& b)
+        {
+            return a.replacement < b.replacement;
+        }
+    );
+
+    return matches;
+}
+
+// =============================================================================
+// Lexing and parsing
+// =============================================================================
+
+// Separate shell operators from words without interpreting quoted characters as operators.
+//
+// It's a small state machine driven by `mode` (QuoteMode). Examples:
+//   echo 'a  b' "c"d      -> [Word echo] [Word "a  b"] [Word cd]
+//   ls>out.txt            -> [Word ls] [RedirectOut] [Word out.txt]
+//   echo hi 2>>err.log    -> [Word echo] [Word hi] [RedirectErrorAppend] [Word err.log]
+//   echo '>' x            -> [Word echo] [Word >] [Word x]   (a quoted > is just text)
+//
+// Throws std::runtime_error on an unclosed quote or a trailing backslash.
+// main() catches it and prints "shell: <message>".
+std::vector<Token> tokenize(const std::string& input) {
     std::vector<Token> tokens;
     std::string current;
     QuoteMode mode = QuoteMode::Normal;
-    bool started = false;
-    auto flush = [&]() {
-        if (started) { tokens.push_back({TokenKind::Word, current}); current.clear(); started = false; }
+    // Tracks "a word has begun" separately from !current.empty(), so that
+    // an empty quoted string ('' or "") still produces an (empty) argument.
+    bool wordStarted = false;
+
+    // Push the word being built, if any. Called on whitespace, before an
+    // operator, and at end of input.
+    auto finishWord = [&]() {
+        if (wordStarted) {
+            tokens.push_back({TokenType::Word, current});
+            current.clear();
+            wordStarted = false;
+        }
     };
-    for (size_t i = 0; i < line.size(); ++i) {
-        char c = line[i];
+
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const char c = input[i];
+
+        // Single quotes: fully literal. Only another ' ends the mode.
         if (mode == QuoteMode::Single) {
-            if (c == '\'') mode = QuoteMode::Normal;
-            else current += c;
-            continue;
-        }
-        if (mode == QuoteMode::Double) {
-            if (c == '"') { mode = QuoteMode::Normal; continue; }
-            if (c == '\\' && i + 1 < line.size()) {
-                char n = line[i + 1];
-                if (n == '$' || n == '`' || n == '"' || n == '\\') { current += n; ++i; continue; }
-                if (n == '\n') { ++i; continue; }
-            }
-            if (c == '$') {
-                std::string expansion;
-                if (consumeParameter(line, i, state, expansion)) { current += expansion; continue; }
-            }
-            current += c;
-            continue;
-        }
-        if (std::isspace(static_cast<unsigned char>(c))) { flush(); continue; }
-        if (c == '\'') { mode = QuoteMode::Single; started = true; continue; }
-        if (c == '"') { mode = QuoteMode::Double; started = true; continue; }
-        if (c == '\\') {
-            if (i + 1 >= line.size()) throw std::runtime_error("incomplete escape");
-            char n = line[++i];
-            if (n != '\n') { current += n; started = true; }
-            continue;
-        }
-        if (c == '$') {
-            std::string expansion;
-            if (consumeParameter(line, i, state, expansion)) {
-                // In this challenge-oriented subset, unquoted expansions stay in one word.
-                // A standalone unset variable does not create an empty argument.
-                if (!expansion.empty()) { current += expansion; started = true; }
-                continue;
-            }
-        }
-        if (!started && (c == '1' || c == '2') && i + 1 < line.size() && line[i + 1] == '>') {
-            if (c == '2' && line.compare(i, 4, "2>&1") == 0) {
-                tokens.push_back({TokenKind::ErrToOut, "2>&1"}); i += 3;
-            } else if (i + 2 < line.size() && line[i + 2] == '>') {
-                tokens.push_back({c == '2' ? TokenKind::RedirErrAppend : TokenKind::RedirAppend,
-                                  std::string(1, c) + ">>"}); i += 2;
+            if (c == '\'') {
+                mode = QuoteMode::Normal;
             } else {
-                tokens.push_back({c == '2' ? TokenKind::RedirErr : TokenKind::RedirOut,
-                                  std::string(1, c) + ">"}); ++i;
+                current += c;
             }
             continue;
         }
-        if (c == '>' || c == '<' || c == '|' || c == '&') {
-            flush();
-            if (c == '>') {
-                if (i + 1 < line.size() && line[i + 1] == '>') {
-                    tokens.push_back({TokenKind::RedirAppend, ">>"}); ++i;
-                } else tokens.push_back({TokenKind::RedirOut, ">"});
-            } else if (c == '<') tokens.push_back({TokenKind::RedirIn, "<"});
-            else if (c == '|') tokens.push_back({TokenKind::Pipe, "|"});
-            else tokens.push_back({TokenKind::Background, "&"});
+
+        // Double quotes: literal, except for backslash before $ ` " \ newline.
+        if (mode == QuoteMode::Double) {
+            if (c == '"') {
+                mode = QuoteMode::Normal;
+            } else if (c == '\\') {
+                if (i + 1 == input.size()) {
+                    throw std::runtime_error("incomplete escape");
+                }
+                const char next = input[i + 1];
+                if (next == '$' || next == '`' || next == '"' || next == '\\') {
+                    current += next;       // Escaped: keep only the second char
+                    ++i;
+                } else if (next == '\n') {
+                    ++i;                   // Line continuation: drop both
+                } else {
+                    current += '\\';       // Not special: keep the backslash
+                }                          // (`next` is handled next iteration)
+            } else {
+                current += c;
+            }
             continue;
         }
-        current += c; started = true;
+
+        // Normal mode.
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            finishWord();
+        } else if (c == '\'') {
+            wordStarted = true;
+            mode = QuoteMode::Single;
+        } else if (c == '"') {
+            wordStarted = true;
+            mode = QuoteMode::Double;
+        } else if (c == '\\') {
+            if (i + 1 == input.size()) {
+                throw std::runtime_error("incomplete escape");
+            }
+            const char next = input[++i];
+            if (next != '\n') {
+                current += next;
+                wordStarted = true;
+            }
+        } else if (!wordStarted && (c == '1' || c == '2') &&
+                   i + 1 < input.size() && input[i + 1] == '>') {
+            // Numbered redirections: 1>, 1>>, 2>, 2>>, 2>&1.
+            // The `!wordStarted` check is important. A digit only counts as a file
+            // descriptor at the *start* of a word, so `echo a2>f` means
+            // word "a2" plus a plain '>' redirect, the same as bash.
+            if (c == '2' && input.compare(i, 4, "2>&1") == 0) {
+                tokens.push_back({TokenType::RedirectErrorToOut, "2>&1"});
+                i += 3;   // Skip ">&1" (the loop's ++i skips the '2')
+            } else if (i + 2 < input.size() && input[i + 2] == '>') {
+                tokens.push_back({c == '1' ? TokenType::RedirectAppend
+                                           : TokenType::RedirectErrorAppend,
+                                  std::string(1, c) + ">>"});
+                i += 2;
+            } else {
+                tokens.push_back({c == '1' ? TokenType::RedirectOut
+                                           : TokenType::RedirectError,
+                                  std::string(1, c) + ">"});
+                ++i;
+            }
+        } else if (c == '>' || c == '<') {
+            // An unquoted operator ends the current word even without a space,
+            // so `ls>out` splits into "ls", ">", "out".
+            finishWord();
+            if (c == '>' && i + 1 < input.size() && input[i + 1] == '>') {
+                tokens.push_back({TokenType::RedirectAppend, ">>"});
+                ++i;
+            } else if (c == '>') {
+                tokens.push_back({TokenType::RedirectOut, ">"});
+            } else {
+                tokens.push_back({TokenType::RedirectInput, "<"});
+            }
+        } else {
+            current += c;
+            wordStarted = true;
+        }
     }
-    if (mode != QuoteMode::Normal) throw std::runtime_error("unclosed quote");
-    flush();
+
+    // Reaching the end of the input while still inside a quote is an error.
+    // (Real shells would show a "> " continuation prompt instead.)
+    if (mode != QuoteMode::Normal) {
+        throw std::runtime_error("unclosed quote");
+    }
+    finishWord();
     return tokens;
 }
 
-Pipeline parsePipeline(const std::vector<Token>& tokens) {
-    Pipeline pipe;
-    pipe.commands.push_back({});
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        const Token& t = tokens[i];
-        Command& cmd = pipe.commands.back();
-        if (t.kind == TokenKind::Word) { cmd.args.push_back(t.value); continue; }
-        if (t.kind == TokenKind::Pipe) {
-            if (cmd.args.empty()) throw std::runtime_error("missing command before pipe");
-            pipe.commands.push_back({}); continue;
-        }
-        if (t.kind == TokenKind::Background) {
-            if (i != tokens.size() - 1) throw std::runtime_error("unexpected '&'");
-            pipe.background = true; continue;
-        }
-        Redirection r;
-        if (t.kind == TokenKind::ErrToOut) {
-            r.target = STDERR_FILENO; r.mode = RedirectMode::Dup; r.source = STDOUT_FILENO;
-        } else {
-            if (i + 1 >= tokens.size() || tokens[i + 1].kind != TokenKind::Word)
-                throw std::runtime_error("expected filename after " + t.value);
-            r.filename = tokens[++i].value;
-            switch (t.kind) {
-                case TokenKind::RedirOut: r.target = 1; r.mode = RedirectMode::Truncate; break;
-                case TokenKind::RedirAppend: r.target = 1; r.mode = RedirectMode::Append; break;
-                case TokenKind::RedirErr: r.target = 2; r.mode = RedirectMode::Truncate; break;
-                case TokenKind::RedirErrAppend: r.target = 2; r.mode = RedirectMode::Append; break;
-                case TokenKind::RedirIn: r.target = 0; r.mode = RedirectMode::Read; break;
-                default: throw std::runtime_error("unsupported redirection");
-            }
-        }
-        cmd.redirects.push_back(std::move(r));
-    }
-    if (pipe.commands.size() > 1 && pipe.commands.back().args.empty())
-        throw std::runtime_error("missing command after pipe");
-    return pipe;
-}
+// Turn the flat token list into argv plus a list of redirections.
+// Every redirection operator except 2>&1 takes the NEXT token as its filename.
+// Redirections can appear anywhere: `> out echo hi` is valid, the same as bash.
+ParsedCommand parseCommand(const std::vector<Token>& tokens) {
+    ParsedCommand parsed;
 
-bool applyRedirections(const std::vector<Redirection>& redirs) {
-    for (const auto& r : redirs) {
-        if (r.mode == RedirectMode::Dup) {
-            if (dup2(r.source, r.target) < 0) { perror("dup2"); return false; }
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        const Token& token = tokens[i];
+        if (token.type == TokenType::Word) {
+            parsed.arguments.push_back(token.value);
             continue;
         }
-        int flags = (r.mode == RedirectMode::Read) ? O_RDONLY :
-                    O_WRONLY | O_CREAT | (r.mode == RedirectMode::Append ? O_APPEND : O_TRUNC);
-        int fd = open(r.filename.c_str(), flags, 0644);
-        if (fd < 0) { perror(r.filename.c_str()); return false; }
-        if (dup2(fd, r.target) < 0) { perror("dup2"); if (fd != r.target) close(fd); return false; }
-        if (fd != r.target) close(fd);
-    }
-    return true;
-}
-class ScopedRedirections {
-    int saved_[3] = {-1,-1,-1};
-    bool active_ = false;
-public:
-    ScopedRedirections() = default;
-    ScopedRedirections(const ScopedRedirections&) = delete;
-    ScopedRedirections& operator=(const ScopedRedirections&) = delete;
-    bool apply(const std::vector<Redirection>& redirs) {
-        if (redirs.empty()) return true;
-        std::cout.flush(); std::cerr.flush();
-        active_ = true;
-        for (int i = 0; i != 3; ++i) {
-            saved_[i] = dup(i);
-            if (saved_[i] < 0) { perror("dup"); restore(); return false; }
-        }
-        if (!applyRedirections(redirs)) { restore(); return false; }
-        return true;
-    }
-    void restore() {
-        if (!active_) return;
-        std::cout.flush(); std::cerr.flush();
-        for (int i = 0; i != 3; ++i) {
-            if (saved_[i] >= 0) {
-                if (dup2(saved_[i], i) < 0) perror("restore dup2");
-                close(saved_[i]); saved_[i] = -1;
+
+        Redirection redirection;
+        if (token.type == TokenType::RedirectErrorToOut) {
+            // 2>&1 means "make fd 2 a copy of fd 1", i.e. dup2(1, 2).
+            redirection.targetFd = STDERR_FILENO;
+            redirection.mode = RedirectionMode::Duplicate;
+            redirection.sourceFd = STDOUT_FILENO;
+        } else {
+            // e.g. `echo hi >` with nothing after the operator.
+            if (i + 1 >= tokens.size() || tokens[i + 1].type != TokenType::Word) {
+                throw std::runtime_error("expected filename after " + token.value);
+            }
+            redirection.filename = tokens[++i].value;   // Consume the filename token
+
+            switch (token.type) {
+                case TokenType::RedirectOut:
+                    redirection.targetFd = STDOUT_FILENO;
+                    redirection.mode = RedirectionMode::Truncate;
+                    break;
+                case TokenType::RedirectAppend:
+                    redirection.targetFd = STDOUT_FILENO;
+                    redirection.mode = RedirectionMode::Append;
+                    break;
+                case TokenType::RedirectError:
+                    redirection.targetFd = STDERR_FILENO;
+                    redirection.mode = RedirectionMode::Truncate;
+                    break;
+                case TokenType::RedirectErrorAppend:
+                    redirection.targetFd = STDERR_FILENO;
+                    redirection.mode = RedirectionMode::Append;
+                    break;
+                case TokenType::RedirectInput:
+                    redirection.targetFd = STDIN_FILENO;
+                    redirection.mode = RedirectionMode::Read;
+                    break;
+                default:
+                    throw std::runtime_error("unsupported redirection");
             }
         }
-        active_ = false;
+        parsed.redirections.push_back(std::move(redirection));
     }
-    ~ScopedRedirections() { restore(); }
-};
 
+    return parsed;
+}
+
+// =============================================================================
+// Command lookup
+// =============================================================================
+
+// Builtins are commands the shell runs itself instead of launching a program.
+// `cd` *must* be a builtin: a child process can't change its parent's working
+// directory. `exit` must be one for the same kind of reason.
+// Point to note: this list also appears in findBuiltinCompletions(). Keep the two in sync.
 bool isBuiltin(const std::string& name) {
-    return name == "exit" || name == "echo" || name == "pwd" || name == "cd" ||
-           name == "type" || name == "complete" || name == "jobs" || name == "history" ||
-           name == "declare" || name == "shopt" || name == "export";
+    return name == "exit" || name == "echo" || name == "pwd" ||
+           name == "cd" || name == "type";
 }
-std::vector<std::string> builtinNames() {
-    return {"cd", "complete", "declare", "echo", "exit", "export", "history", "jobs", "pwd", "shopt", "type"};
-}
-std::string findExecutable(const std::string& name) {
-    auto test = [](const fs::path& p) {
-        std::error_code ec;
-        return fs::is_regular_file(p, ec) && access(p.c_str(), X_OK) == 0;
+
+// Resolve a command name to an executable path, or "" if none is found.
+//   * A name containing '/' (./run, /bin/ls, bin/tool) is used as-is, with no PATH search.
+//   * Otherwise each directory in $PATH (separated by ':') is tried in order.
+//     The first match wins, which is why PATH order matters.
+std::string findExecutable(const std::string& command) {
+    namespace fs = std::filesystem;
+
+    // "Executable" here means a regular file (not a directory) that we have
+    // permission to execute. access(X_OK) checks with the *real* user ID.
+    auto executable = [](const fs::path& path) {
+        std::error_code error;
+        return fs::is_regular_file(path, error) &&
+               access(path.c_str(), X_OK) == 0;
     };
-    if (name.find('/') != std::string::npos) return test(name) ? name : "";
-    const char* env = std::getenv("PATH");
-    if (!env) return "";
-    std::string dirs(env);
-    size_t pos = 0;
+
+    if (command.find('/') != std::string::npos) {
+        return executable(command) ? command : "";
+    }
+
+    const char* pathVariable = std::getenv("PATH");
+    if (!pathVariable) {
+        return "";
+    }
+
+    const std::string pathText(pathVariable);
+    std::size_t start = 0;
     while (true) {
-        size_t end = dirs.find(':', pos);
-        std::string dir = dirs.substr(pos, end == std::string::npos ? end : end-pos);
-        fs::path candidate = fs::path(dir.empty() ? "." : dir) / name;
-        if (test(candidate)) return candidate.string();
-        if (end == std::string::npos) break;
-        pos = end + 1;
+        const std::size_t end = pathText.find(':', start);
+        // When end == npos, (end - start) is huge, and substr() simply clamps it
+        // to "the rest of the string".
+        const std::string directory = pathText.substr(start, end - start);
+        // An empty PATH entry ("::" or a leading/trailing ':') means the current
+        // directory. This is a POSIX rule, and a known security pitfall.
+        const fs::path candidate = fs::path(directory.empty() ? "." : directory) / command;
+        if (executable(candidate)) {
+            return candidate.string();
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
     }
     return "";
 }
 
-std::vector<std::string> builtinAndPathCompletions(const std::string& prefix) {
-    std::vector<std::string> names;
-    for (const auto& b : builtinNames()) if (b.rfind(prefix, 0) == 0) names.push_back(b);
-    const char* env = std::getenv("PATH");
-    if (env) {
-        std::string dirs(env);
-        size_t pos = 0;
-        while (true) {
-            size_t end = dirs.find(':', pos);
-            std::string dir = dirs.substr(pos, end == std::string::npos ? end : end-pos);
-            std::error_code ec;
-            fs::directory_iterator it(dir.empty() ? "." : dir,
-                fs::directory_options::skip_permission_denied, ec), last;
-            while (!ec && it != last) {
-                std::string base = it->path().filename().string();
-                if (base.rfind(prefix, 0) == 0) {
-                    std::error_code fileec;
-                    if (fs::is_regular_file(it->path(), fileec) && access(it->path().c_str(), X_OK) == 0)
-                        names.push_back(base);
-                }
-                it.increment(ec);
+// =============================================================================
+// Redirection
+// =============================================================================
+
+// Apply each redirection to THIS process's file descriptors, in order.
+// Returns false (after printing an error) if any of them fails.
+//
+// The key system call is dup2(oldfd, newfd): it makes `newfd` refer to the same
+// open file as `oldfd`, closing whatever `newfd` pointed to before. Anything
+// that later writes to fd 1 (std::cout, printf, or an exec'd program) ends up
+// in the file.
+bool applyRedirections(const std::vector<Redirection>& redirections) {
+    for (const Redirection& redirection : redirections) {
+        if (redirection.mode == RedirectionMode::Duplicate) {
+            // 2>&1: copy whatever fd 1 points to *at this moment* onto fd 2.
+            if (dup2(redirection.sourceFd, redirection.targetFd) == -1) {
+                perror("dup2");
+                return false;
             }
-            if (end == std::string::npos) break;
-            pos = end + 1;
+            continue;
+        }
+
+        int flags = O_RDONLY;
+        switch (redirection.mode) {
+            case RedirectionMode::Truncate:
+                flags = O_WRONLY | O_CREAT | O_TRUNC;
+                break;
+            case RedirectionMode::Append:
+                flags = O_WRONLY | O_CREAT | O_APPEND;
+                break;
+            case RedirectionMode::Read:
+                flags = O_RDONLY;
+                break;
+            default:
+                return false;
+        }
+
+        // 0644 = rw-r--r--. It is only used when O_CREAT creates a new file,
+        // and the process umask is subtracted from it.
+        const int fd = open(redirection.filename.c_str(), flags, 0644);
+        if (fd == -1) {
+            perror(redirection.filename.c_str());   // e.g. "out.txt: Permission denied"
+            return false;
+        }
+        if (dup2(fd, redirection.targetFd) == -1) {
+            perror("dup2");
+            if (fd != redirection.targetFd) {
+                close(fd);
+            }
+            return false;
+        }
+        // After dup2, `targetFd` refers to the file, so the temporary `fd` is no
+        // longer needed. Close it to avoid leaking descriptors. The `!=` guard
+        // covers the rare case where open() returned the target number itself
+        // (when that fd was closed). Closing it would undo the redirection.
+        if (fd != redirection.targetFd) {
+            close(fd);
         }
     }
-    std::sort(names.begin(), names.end());
-    names.erase(std::unique(names.begin(), names.end()), names.end());
-    return names;
+    return true;
 }
-std::string commonPrefix(const std::vector<std::string>& items) {
-    if (items.empty()) return "";
-    size_t n = items[0].size();
-    for (size_t i = 1; i < items.size(); ++i) {
+
+// =============================================================================
+// Command-name completion
+// =============================================================================
+
+// Builtin names that start with `prefix`.
+std::vector<std::string> findBuiltinCompletions(const std::string &prefix)
+{
+    const std::vector<std::string> builtins = {"exit", "echo", "pwd", "cd", "type"};
+    std::vector<std::string> matches;
+
+    for (const auto& builtin : builtins)
+    {
+        if (builtin.rfind(prefix, 0) == 0)   // starts_with(prefix)
+        {
+            matches.push_back(builtin);
+        }
+    }
+
+    return matches;
+}
+
+// Builtins plus every executable in every $PATH directory whose name starts
+// with `prefix`. The result is sorted and de-duplicated.
+// Point to note: this scans every PATH directory on every TAB press. That's fine
+// for a toy shell. Bash keeps a hash table of commands it has found instead.
+std::vector<std::string> findExecutableCompletions(const std::string& prefix)
+{
+    namespace fs = std::filesystem;
+
+    //Match the builtins
+    std::vector<std::string> matches = findBuiltinCompletions(prefix);
+
+    //Read Path
+    const char* pathVariable = std::getenv("PATH");
+
+    if (!pathVariable)
+    {
+        std::sort(matches.begin(), matches.end());
+
+        matches.erase(
+            std::unique(matches.begin(), matches.end()),
+            matches.end()
+        );
+
+        return matches;
+    }
+    std::string pathText(pathVariable);
+
+    size_t start = 0;
+
+
+    //Visit each path directory
+    while(true)
+    {
+        size_t end = pathText.find(':', start);
+
+        std::string directory = pathText.substr(start, end == std::string::npos ? std::string::npos : end - start);
+
+        // Empty path components represent current directory
+        fs::path folder = directory.empty() ? fs::path(".") : fs::path(directory);
+
+        // Non-throwing: PATH often lists directories that don't exist.
+        std::error_code directoryError;
+
+        fs::directory_iterator it(folder, fs::directory_options::skip_permission_denied, directoryError);
+
+        fs::directory_iterator last;
+
+        while (!directoryError && it != last)
+        {
+            const fs::directory_entry& entry = *it;
+
+            std::string filename =
+                entry.path().filename().string();
+
+            // Does the entry name start with what the user typed?
+            bool prefixMatches =
+                filename.rfind(prefix, 0) == 0;
+
+            if (prefixMatches)
+            {
+                std::error_code fileError;
+
+                // Keep it only if it's a regular file we can execute
+                // (same rule as findExecutable()).
+                if (fs::is_regular_file(entry.path(), fileError) &&
+                    access(entry.path().c_str(), X_OK) == 0)
+                {
+                    matches.push_back(filename);
+                }
+            }
+
+            it.increment(directoryError);
+
+        }
+        if(end == std::string::npos)
+            break;
+
+        start = end + 1;
+
+    }
+
+    //Sort Alphabetically
+    std::sort(matches.begin(), matches.end());
+
+    //Remove repeated command names
+    // The same name can show up more than once: a builtin and /bin/echo, or
+    // /bin/ls and /usr/bin/ls on "merged /usr" systems. std::unique only
+    // collapses *adjacent* duplicates (that's why we sort first), and it returns
+    // the new logical end, which erase() then trims. This is the erase-unique idiom.
+    matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
+
+    return matches;
+
+}
+
+
+// Longest string that every element starts with.
+//   {"echo", "ecr", "ed"} -> "e"     {"main.cpp", "main.h"} -> "main."
+// Used for partial completion: when several names match, insert the shared part.
+std::string longestCommonPrefix(const std::vector<std::string>& matches)
+{
+    if (matches.empty())
+        return "";
+
+    const std::string& first = matches[0];
+
+    size_t commonLength = first.size();
+
+    // Compare each matching name against the first.
+    // `commonLength` can only shrink, so each comparison is bounded by it.
+    for (size_t i = 1; i < matches.size(); ++i)
+    {
         size_t j = 0;
-        while (j < n && j < items[i].size() && items[0][j] == items[i][j]) ++j;
-        n = j;
+
+        while (j < commonLength && j < matches[i].size() && first[j] == matches[i][j])
+        {
+            ++j;
+        }
+
+        commonLength = j;
+
+        if (commonLength == 0)
+            break;          // Nothing in common. No need to look further.
     }
-    return items[0].substr(0, n);
+
+    return first.substr(0, commonLength);
 }
 
-// History persistence: 'history -a' only appends entries not previously appended.
-std::string historyFile(const std::vector<std::string>& args, size_t index) {
-    if (args.size() > index) return args[index];
-    const char* env = std::getenv("HISTFILE");
-    return env ? std::string(env) : "";
-}
-bool readHistory(ShellState& state, const std::string& file) {
-    std::ifstream stream(file);
-    if (!stream) { std::cerr << "history: " << file << ": cannot read file\n"; return false; }
-    std::string line;
-    while (std::getline(stream, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        state.history.push_back(line);
-    }
-    return true;
-}
-bool writeHistory(ShellState& state, const std::string& file, bool append) {
-    std::ofstream stream(file, append ? std::ios::app : std::ios::trunc);
-    if (!stream) { std::cerr << "history: " << file << ": cannot write file\n"; return false; }
-    size_t first = append ? state.historyFlushed : 0;
-    for (size_t i = first; i < state.history.size(); ++i) stream << state.history[i] << '\n';
-    stream.flush();
-    if (!stream) { std::cerr << "history: " << file << ": write failed\n"; return false; }
-    state.historyFlushed = state.history.size();
-    return true;
-}
-void initialHistory(ShellState& state) {
-    const char* path = std::getenv("HISTFILE");
-    if (path && *path) {
-        std::ifstream input(path);
-        std::string line;
-        while (std::getline(input, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            state.history.push_back(line);
-        }
-        state.historyFlushed = state.history.size();
-    }
-}
-void saveHistoryOnExit(ShellState& state) {
-    const char* path = std::getenv("HISTFILE");
-    if (path && *path) writeHistory(state, path, state.historyAppendOnExit);
-}
 
-bool jobFinished(const Job& job) {
-    return std::all_of(job.finished.begin(), job.finished.end(), [](bool v) { return v; });
-}
-void updateJobStatus(ShellState& state) {
-    for (auto& job : state.jobs) {
-        for (size_t i = 0; i < job.pids.size(); ++i) {
-            if (job.finished[i]) continue;
-            int status = 0;
-            pid_t res;
-            do { res = waitpid(job.pids[i], &status, WNOHANG); }
-            while (res < 0 && errno == EINTR);
-            if (res == job.pids[i] || (res < 0 && errno == ECHILD)) job.finished[i] = true;
-        }
-    }
-}
-std::string jobMarker(const ShellState& state, int jobNumber) {
-    // '+' marks the newest job, even when its numeric ID was recycled.
-    size_t newest = 0, previous = 0;
-    int newestId = -1, previousId = -1;
-    for (const auto& job : state.jobs) {
-        if (job.launchOrder > newest) {
-            previous = newest; previousId = newestId;
-            newest = job.launchOrder; newestId = job.number;
-        } else if (job.launchOrder > previous) {
-            previous = job.launchOrder; previousId = job.number;
-        }
-    }
-    if (jobNumber == newestId) return "+";
-    if (jobNumber == previousId) return "-";
-    return " ";
-}
-int nextJobNumber(const ShellState& state) {
-    for (int n = 1;; ++n) {
-        bool used = false;
-        for (const auto& j : state.jobs) if (j.number == n) used = true;
-        if (!used) return n;
-    }
-}
-void announceFinishedJobs(ShellState& state) {
-    updateJobStatus(state);
-    for (auto& job : state.jobs) {
-        if (jobFinished(job) && !job.notified) {
-            std::cout << '[' << job.number << ']' << jobMarker(state, job.number)
-                      << "  Done                    " << job.text << '\n';
-            job.notified = true;
-        }
-    }
-    state.jobs.erase(std::remove_if(state.jobs.begin(), state.jobs.end(),
-        [](const Job& j) { return j.notified; }), state.jobs.end());
-}
+// Builtins run in the parent; always restore its standard descriptors afterward.
+//
+// Why this is needed: an external command is redirected inside its forked
+// child, and the parent never notices. A builtin like `echo hi > f` runs in
+// the shell process itself. Without restoring fd 1, every later prompt and
+// output would also go into f.
+//
+// How: dup() each of fds 0-2 to a spare descriptor (the backup), apply the
+// redirections, and in the destructor dup2() the backups back. This is RAII:
+// the restore runs however the scope is left, including the `return` for `exit`
+// in main().
+class ScopedRedirections {
+public:
+    ScopedRedirections() = default;
+    // Non-copyable: the object owns the backup descriptors. A copy would
+    // restore and close the same fds twice.
+    ScopedRedirections(const ScopedRedirections&) = delete;
+    ScopedRedirections& operator=(const ScopedRedirections&) = delete;
 
-std::string shellQuoted(const std::string& s) {
-    std::string result = "'";
-    for (char c : s) result += c == '\'' ? "'\\''" : std::string(1, c);
-    return result + "'";
-}
-std::string declareQuoted(const std::string& s) {
-    std::string value = "\"";
-    for (char c : s) {
-        if (c == '"' || c == '\\' || c == '$' || c == '`') value += '\\';
-        value += c;
-    }
-    return value + '"';
-}
+    bool apply(const std::vector<Redirection>& redirections) {
+        if (redirections.empty()) {
+            return true;   // Nothing to do, so no backups are needed
+        }
 
-// Return status. Running an exit builtin signals the caller through ShellState.
-int runBuiltin(const std::vector<std::string>& args, ShellState& state) {
-    if (args.empty()) return 0;
-    const std::string& cmd = args[0];
-    if (cmd == "exit") {
-        state.shouldExit = true;
-        state.exitCode = args.size() > 1 ? std::atoi(args[1].c_str()) : state.lastStatus;
-        return state.exitCode;
+        // std::cout has its own user-space buffer. Flush it before switching
+        // fds so text written *before* the redirection doesn't land in the file.
+        std::cout.flush();
+        std::cerr.flush();
+        for (int fd = 0; fd < 3; ++fd) {
+            saved_[fd] = dup(fd);   // Backup copy of stdin/stdout/stderr
+            if (saved_[fd] == -1) {
+                perror("dup");
+                discardSaved();
+                return false;
+            }
+        }
+        active_ = true;
+        if (!applyRedirections(redirections)) {
+            restore();
+            return false;
+        }
+        return true;
     }
-    if (cmd == "echo") {
-        for (size_t i = 1; i < args.size(); ++i) {
-            if (i > 1) std::cout << ' ';
+
+    ~ScopedRedirections() { restore(); }
+
+private:
+    int saved_[3] = {-1, -1, -1};   // Backups of fds 0, 1, 2 (-1 = none)
+    bool active_ = false;           // true while redirections are in effect
+
+    // Close the backup descriptors without restoring anything.
+    void discardSaved() {
+        for (int& fd : saved_) {
+            if (fd != -1) {
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+
+    // Put the original stdin/stdout/stderr back, then close the backups.
+    void restore() {
+        if (!active_) {
+            return;
+        }
+        // Flush so output from the builtin reaches the redirected file
+        // before fd 1 is pointed back at the terminal.
+        std::cout.flush();
+        std::cerr.flush();
+        for (int fd = 0; fd < 3; ++fd) {
+            if (dup2(saved_[fd], fd) == -1) {
+                perror("dup2 restore");
+            }
+        }
+        discardSaved();
+        active_ = false;
+    }
+};
+
+// =============================================================================
+// Execution
+// =============================================================================
+
+// Execute builtins other than exit, which is handled by main().
+// Returns a shell-style status: 0 = success, non-zero = failure.
+// Point to note: main() currently ignores this value (there's no `$?` yet).
+int executeBuiltin(const std::vector<std::string>& args) {
+    const std::string& command = args[0];
+
+    if (command == "echo") {
+        // Print the arguments separated by single spaces. Quoting was already
+        // handled by the tokenizer, so `echo "a   b"` keeps its three spaces.
+        // Flags like -n / -e are not supported.
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (i > 1) {
+                std::cout << ' ';
+            }
             std::cout << args[i];
         }
-        std::cout << '\n'; return 0;
-    }
-    if (cmd == "pwd") {
-        std::error_code ec;
-        auto cwd = fs::current_path(ec);
-        if (ec) { std::cerr << "pwd: " << ec.message() << '\n'; return 1; }
-        std::cout << cwd.string() << '\n'; return 0;
-    }
-    if (cmd == "cd") {
-        std::string path;
+        std::cout << '\n';
+    } else if (command == "pwd") {
+        std::error_code error;
+        const auto cwd = std::filesystem::current_path(error);
+        if (error) {
+            std::cerr << "pwd: " << error.message() << '\n';
+        } else {
+            std::cout << cwd.string() << '\n';
+        }
+    } else if (command == "cd") {
+        std::filesystem::path destination;
+        // `cd` and `cd ~` both go to $HOME. Note: `~/dir` is NOT expanded;
+        // only a bare "~" is handled here.
         if (args.size() == 1 || args[1] == "~") {
             const char* home = std::getenv("HOME");
-            if (!home) { std::cerr << "cd: HOME not set\n"; return 1; }
-            path = home;
-        } else path = args[1];
-        std::error_code ec;
-        fs::current_path(path, ec);
-        if (ec) { std::cerr << "cd: " << path << ": " << ec.message() << '\n'; return 1; }
-        return 0;
-    }
-    if (cmd == "type") {
-        if (args.size() < 2) { std::cerr << "type: missing operand\n"; return 1; }
-        int status = 0;
-        for (size_t i = 1; i < args.size(); ++i) {
-            if (isBuiltin(args[i])) std::cout << args[i] << " is a shell builtin\n";
-            else {
-                std::string found = findExecutable(args[i]);
-                if (!found.empty()) std::cout << args[i] << " is " << found << '\n';
-                else { std::cout << args[i] << ": not found\n"; status = 1; }
+            if (!home) {
+                std::cerr << "cd: HOME not set\n";
+                return 1;
             }
-        }
-        return status;
-    }
-    if (cmd == "complete") {
-        if (args.size() >= 2 && args[1] == "-C") {
-            if (args.size() < 4) { std::cerr << "complete: usage: complete -C command name\n"; return 2; }
-            for (size_t i = 3; i < args.size(); ++i) state.completions[args[i]] = args[2];
-            return 0;
-        }
-        if (args.size() >= 2 && args[1] == "-r") {
-            if (args.size() < 3) { state.completions.clear(); return 0; }
-            int result = 0;
-            for (size_t i = 2; i < args.size(); ++i)
-                if (!state.completions.erase(args[i])) result = 1;
-            return result;
-        }
-        if (args.size() == 1 || args[1] == "-p") {
-            if (args.size() <= 2) {
-                for (const auto& kv : state.completions)
-                    std::cout << "complete -C " << shellQuoted(kv.second) << ' ' << kv.first << '\n';
-                return 0;
-            }
-            int status = 0;
-            for (size_t i = 2; i < args.size(); ++i) {
-                auto it = state.completions.find(args[i]);
-                if (it == state.completions.end()) {
-                    std::cerr << "complete: " << args[i] << ": no completion specification\n";
-                    status = 1;
-                } else std::cout << "complete -C " << shellQuoted(it->second) << ' ' << it->first << '\n';
-            }
-            return status;
-        }
-        std::cerr << "complete: unsupported option\n"; return 2;
-    }
-    if (cmd == "jobs") {
-        updateJobStatus(state);
-        int specific = -1;
-        if (args.size() > 1) {
-            std::string n = args[1];
-            if (!n.empty() && n[0] == '%') n.erase(0, 1);
-            if (n.empty() || !std::all_of(n.begin(), n.end(), [](char c){return std::isdigit(static_cast<unsigned char>(c));})) {
-                std::cerr << "jobs: invalid job number\n"; return 1;
-            }
-            specific = std::atoi(n.c_str());
-        }
-        bool found = false;
-        for (const auto& job : state.jobs) {
-            if (specific >= 0 && job.number != specific) continue;
-            found = true;
-            std::cout << '[' << job.number << ']' << jobMarker(state, job.number)
-                      << "  " << (jobFinished(job) ? "Done" : "Running") << "                 " << job.text << '\n';
-        }
-        if (specific >= 0 && !found) { std::cerr << "jobs: %" << specific << ": no such job\n"; return 1; }
-        return 0;
-    }
-    if (cmd == "history") {
-        if (args.size() > 1 && (args[1] == "-r" || args[1] == "-w" || args[1] == "-a")) {
-            std::string path = historyFile(args, 2);
-            if (path.empty()) { std::cerr << "history: no history file\n"; return 1; }
-            if (args[1] == "-r") return readHistory(state, path) ? 0 : 1;
-            return writeHistory(state, path, args[1] == "-a") ? 0 : 1;
-        }
-        size_t count = state.history.size();
-        if (args.size() > 1) {
-            try { count = static_cast<size_t>(std::stoull(args[1])); }
-            catch (...) { std::cerr << "history: numeric argument required\n"; return 1; }
-        }
-        size_t from = state.history.size() > count ? state.history.size() - count : 0;
-        for (size_t i = from; i < state.history.size(); ++i)
-            std::cout << std::setw(5) << (i + 1) << "  " << state.history[i] << '\n';
-        return 0;
-    }
-    if (cmd == "declare") {
-        if (args.size() == 1) {
-            std::map<std::string, std::string> sorted(state.variables.begin(), state.variables.end());
-            for (const auto& kv : sorted)
-                std::cout << "declare -- " << kv.first << '=' << declareQuoted(kv.second) << '\n';
-            return 0;
-        }
-        if (args[1] == "-p") {
-            if (args.size() == 2) {
-                std::map<std::string, std::string> sorted(state.variables.begin(), state.variables.end());
-                for (const auto& kv : sorted)
-                    std::cout << "declare -- " << kv.first << '=' << declareQuoted(kv.second) << '\n';
-                return 0;
-            }
-            int status = 0;
-            for (size_t i = 2; i < args.size(); ++i) {
-                auto it = state.variables.find(args[i]);
-                if (it != state.variables.end())
-                    std::cout << "declare -- " << it->first << '=' << declareQuoted(it->second) << '\n';
-                else { std::cerr << "bash: declare: " << args[i] << ": not found\n"; status = 1; }
-            }
-            return status;
-        }
-        int status = 0;
-        for (size_t i = 1; i < args.size(); ++i) {
-            size_t eq = args[i].find('=');
-            std::string name = args[i].substr(0, eq);
-            if (!validName(name)) {
-                std::cerr << "bash: declare: `" << args[i] << "': not a valid identifier\n";
-                status = 1;
-                continue;
-            }
-            if (eq != std::string::npos) state.variables[name] = args[i].substr(eq + 1);
-            else if (state.variables.find(name) == state.variables.end()) state.variables[name] = "";
-        }
-        return status;
-    }
-    if (cmd == "shopt") {
-        if (args.size() >= 3 && (args[1] == "-s" || args[1] == "-u") && args[2] == "histappend") {
-            state.historyAppendOnExit = args[1] == "-s"; return 0;
-        }
-        if (args.size() >= 3 && args[1] == "-q" && args[2] == "histappend")
-            return state.historyAppendOnExit ? 0 : 1;
-        std::cerr << "shopt: unsupported option\n"; return 1;
-    }
-    if (cmd == "export") {
-        for (size_t i = 1; i < args.size(); ++i) {
-            size_t eq = args[i].find('=');
-            std::string name = args[i].substr(0, eq);
-            if (!validName(name)) { std::cerr << "export: invalid identifier\n"; return 1; }
-            std::string value = eq == std::string::npos ? variableValue(name, state) : args[i].substr(eq + 1);
-            state.variables[name] = value;
-            if (setenv(name.c_str(), value.c_str(), 1) < 0) { perror("setenv"); return 1; }
-        }
-        return 0;
-    }
-    return 1;
-}
-
-struct CompletionContext {
-    bool isCommand = true;
-    std::string commandName;
-    std::string previousWord;
-    std::string prefix;
-    size_t rawStart = 0;
-    QuoteMode quoteMode = QuoteMode::Normal;
-};
-struct Candidate { std::string text; bool appendSpace = true; };
-
-// Completion cannot use lex() because incomplete quoted words are normal during editing.
-CompletionContext completionContext(const std::string& line) {
-    CompletionContext ctx;
-    std::vector<std::string> words;
-    std::string current;
-    bool started = false;
-    QuoteMode mode = QuoteMode::Normal;
-    size_t start = line.size();
-    for (size_t i = 0; i < line.size(); ++i) {
-        char c = line[i];
-        if (mode == QuoteMode::Single) {
-            if (c == '\'') mode = QuoteMode::Normal;
-            else current += c;
-            continue;
-        }
-        if (mode == QuoteMode::Double) {
-            if (c == '"') mode = QuoteMode::Normal;
-            else if (c == '\\' && i + 1 < line.size()) {
-                char n = line[i+1];
-                if (n == '$' || n == '`' || n == '"' || n == '\\') { current += n; ++i; }
-                else current += c;
-            } else current += c;
-            continue;
-        }
-        if (std::isspace(static_cast<unsigned char>(c))) {
-            if (started) { words.push_back(current); current.clear(); started = false; }
-            start = i + 1;
+            destination = home;
         } else {
-            if (!started) { started = true; start = i; }
-            if (c == '\'') mode = QuoteMode::Single;
-            else if (c == '"') mode = QuoteMode::Double;
-            else if (c == '\\' && i + 1 < line.size()) current += line[++i];
-            else current += c;
+            destination = args[1];
         }
-    }
-    ctx.isCommand = words.empty();
-    ctx.commandName = words.empty() ? (started ? current : "") : words[0];
-    ctx.previousWord = words.empty() ? "" : words.back();
-    ctx.prefix = current;
-    ctx.rawStart = started ? start : line.size();
-    ctx.quoteMode = mode;
-    return ctx;
-}
-std::string escapeSuffix(const std::string& suffix, QuoteMode mode) {
-    std::string result;
-    for (char c : suffix) {
-        if (mode == QuoteMode::Single) {
-            if (c == '\'') result += "'\\''";
-            else result += c;
-        } else if (mode == QuoteMode::Double) {
-            if (c == '$' || c == '"' || c == '\\' || c == '`') result += '\\';
-            result += c;
+
+        // current_path(p) is the C++ wrapper around chdir(2). It changes the
+        // working directory of THIS process, which is why cd is a builtin.
+        std::error_code error;
+        std::filesystem::current_path(destination, error);
+        if (error) {
+            std::cerr << "cd: " << destination.string() << ": " << error.message() << '\n';
+            return 1;
+        }
+    } else if (command == "type") {
+        // Report how a name would be resolved: builtin first, then PATH.
+        if (args.size() < 2) {
+            std::cerr << "type: missing operand\n";
+            return 1;
+        }
+        const std::string& name = args[1];
+        if (isBuiltin(name)) {
+            std::cout << name << " is a shell builtin\n";
         } else {
-            if (std::isspace(static_cast<unsigned char>(c)) ||
-                std::string("\\'\"<>|&;$`*?[]()").find(c) != std::string::npos)
-                result += '\\';
-            result += c;
+            const std::string path = findExecutable(name);
+            if (path.empty()) {
+                // stdout, not stderr. The CodeCrafters tests expect it there.
+                std::cout << name << ": not found\n";
+                return 1;
+            }
+            std::cout << name << " is " << path << '\n';
         }
     }
-    return result;
-}
-std::vector<Candidate> filenameCompletions(const std::string& prefix, bool dirsOnly) {
-    size_t slash = prefix.find_last_of('/');
-    std::string directory = slash == std::string::npos ? "." : prefix.substr(0, slash + 1);
-    std::string partial = slash == std::string::npos ? prefix : prefix.substr(slash + 1);
-    std::string typedDir = slash == std::string::npos ? "" : prefix.substr(0, slash + 1);
-    std::vector<Candidate> result;
-    std::error_code ec;
-    fs::directory_iterator it(directory, fs::directory_options::skip_permission_denied, ec), end;
-    while (!ec && it != end) {
-        std::string name = it->path().filename().string();
-        bool hidden = !name.empty() && name[0] == '.';
-        if (name.rfind(partial, 0) == 0 && (!hidden || (!partial.empty() && partial[0] == '.'))) {
-            std::error_code typeErr;
-            bool isDir = it->is_directory(typeErr);
-            if (!typeErr && (isDir || !dirsOnly))
-                result.push_back({typedDir + name + (isDir ? "/" : ""), !isDir});
-        }
-        it.increment(ec);
-    }
-    std::sort(result.begin(), result.end(), [](auto& a, auto& b){return a.text < b.text;});
-    return result;
+    return 0;
 }
 
-// Runs a registered -C completer, with output captured via a pipe.
-std::vector<std::string> runCompleter(const std::string& specification,
-                                      const CompletionContext& ctx,
-                                      const std::string& line,
-                                      const ShellState& state) {
-    std::vector<std::string> names;
-    std::vector<Token> tokens;
-    try { tokens = lex(specification, state); }
-    catch (...) { return names; }
-    std::vector<std::string> args;
-    for (const auto& t : tokens) {
-        if (t.kind != TokenKind::Word) return names;
-        args.push_back(t.value);
+// Run an external program using the classic fork/exec/wait pattern:
+//   1. fork()   creates a copy of this process (the child).
+//   2. Child:   applies redirections to its own fds, then execv() replaces the
+//               child's program image with the target program.
+//   3. Parent:  waitpid() blocks until the child finishes.
+// Returns the child's exit status, using the shell conventions below.
+int executeExternal(const ParsedCommand& command) {
+    const pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return 1;
     }
-    if (args.empty()) return names;
-    args.push_back(ctx.commandName);
-    args.push_back(ctx.prefix);
-    args.push_back(ctx.previousWord);
-    int fds[2];
-    if (pipe(fds) < 0) return names;
-    std::cout.flush(); std::cerr.flush();
-    pid_t pid = fork();
-    if (pid < 0) { close(fds[0]); close(fds[1]); return names; }
+
+    // fork() returns 0 in the child and the child's PID in the parent.
     if (pid == 0) {
-        close(fds[0]);
-        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(126);
-        close(fds[1]);
-        setenv("COMP_LINE", line.c_str(), 1);
-        std::string point = std::to_string(line.size());
-        setenv("COMP_POINT", point.c_str(), 1);
-        setenv("COMP_TYPE", "9", 1);
-        setenv("COMP_KEY", "9", 1);
-        std::string resolved = findExecutable(args[0]);
-        if (resolved.empty()) _exit(127);
+        // The child redirects its own descriptors, not the parent's.
+        if (!applyRedirections(command.redirections)) {
+            _exit(1);
+        }
+
+        // The lookup happens *after* redirection, so "command not found" goes
+        // to the redirected stderr, as in bash: `nope 2>/dev/null` stays silent.
+        const std::string path = findExecutable(command.arguments[0]);
+        if (path.empty()) {
+            std::cerr << command.arguments[0] << ": command not found\n";
+            _exit(127);   // 127 = "command not found", by shell convention
+        }
+
+        // execv needs writable C-string pointers and a final null pointer.
+        // The child gets a private copy of the strings to point into.
+        // Point to note: argv[0] is the name as typed (e.g. "ls"), not the full
+        // path. That's the Unix convention, and some programs check argv[0].
+        std::vector<std::string> argumentStorage = command.arguments;
         std::vector<char*> argv;
-        for (auto& a : args) argv.push_back(a.data());
+        argv.reserve(argumentStorage.size() + 1);
+        for (std::string& argument : argumentStorage) {
+            argv.push_back(argument.data());   // non-const data() since C++17
+        }
         argv.push_back(nullptr);
-        execv(resolved.c_str(), argv.data());
-        _exit(126);
-    }
-    close(fds[1]);
-    std::string output;
-    char buffer[4096];
-    while (true) {
-        ssize_t count = read(fds[0], buffer, sizeof(buffer));
-        if (count == 0) break;
-        if (count < 0) { if (errno == EINTR) continue; break; }
-        if (output.size() + static_cast<size_t>(count) > 1024 * 1024) break;
-        output.append(buffer, static_cast<size_t>(count));
-    }
-    close(fds[0]);
-    int status = 0;
-    while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
-    std::istringstream reader(output);
-    std::string name;
-    while (std::getline(reader, name)) {
-        if (!name.empty() && name.back() == '\r') name.pop_back();
-        if (!name.empty()) names.push_back(name);
-    }
-    std::sort(names.begin(), names.end());
-    names.erase(std::unique(names.begin(), names.end()), names.end());
-    return names;
-}
-std::vector<Candidate> collectCompletions(const std::string& line,
-                                          const CompletionContext& ctx,
-                                          const ShellState& state) {
-    std::vector<Candidate> choices;
-    if (ctx.isCommand) {
-        for (const auto& name : builtinAndPathCompletions(ctx.prefix))
-            choices.push_back({name, true});
-    } else if (const auto it = state.completions.find(ctx.commandName);
-               it != state.completions.end()) {
-        for (const auto& text : runCompleter(it->second, ctx, line, state))
-            choices.push_back({text, true});
-    } else {
-        // A blank argument lists the current directory (dotfiles stay hidden).
-        choices = filenameCompletions(ctx.prefix, ctx.commandName == "cd");
-    }
-    return choices;
-}
 
-class TerminalGuard {
-    termios original_{};
-    bool active_ = false;
-public:
-    TerminalGuard() {
-        if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &original_) < 0) return;
-        termios updated = original_;
-        updated.c_lflag &= ~(ICANON | ECHO);
-        updated.c_cc[VMIN] = 1;
-        updated.c_cc[VTIME] = 0;
-        active_ = tcsetattr(STDIN_FILENO, TCSANOW, &updated) == 0;
+        // On success execv never returns: this process *becomes* the program.
+        // The environment is inherited automatically.
+        execv(path.c_str(), argv.data());
+        // Reaching here means exec failed (e.g. bad binary format).
+        perror("execv");
+        // _exit, not exit: exit() would run atexit handlers and static
+        // destructors and flush stdio buffers copied from the parent, which can
+        // print the same output twice. _exit ends the child immediately.
+        _exit(126);   // 126 = "found but could not execute", by shell convention
     }
-    bool active() const { return active_; }
-    ~TerminalGuard() { if (active_) tcsetattr(STDIN_FILENO, TCSANOW, &original_); }
-};
-void redrawLine(const std::string& line) {
-    std::cout << "\r\033[2K$ " << line;
-}
-bool readInputLine(std::string& input, const ShellState& state) {
-    TerminalGuard guard;
-    if (!guard.active()) return static_cast<bool>(std::getline(std::cin, input));
-    input.clear();
-    size_t historyIndex = state.history.size();
-    std::string draft;
-    bool tabAmbiguous = false;
-    while (true) {
-        char c = 0;
-        ssize_t n = read(STDIN_FILENO, &c, 1);
-        if (n == 0) return !input.empty();
-        if (n < 0) { if (errno == EINTR) continue; return false; }
-        if (c == '\n' || c == '\r') { std::cout << '\n'; return true; }
-        if (c == 4 && input.empty()) { std::cout << '\n'; return false; }
-        if (c == 127 || c == '\b') {
-            if (!input.empty()) { input.pop_back(); std::cout << "\b \b"; }
-            tabAmbiguous = false; continue;
-        }
-        if (c == '\033') {
-            char next = 0, arrow = 0;
-            if (read(STDIN_FILENO, &next, 1) != 1 || next != '[' ||
-                read(STDIN_FILENO, &arrow, 1) != 1) continue;
-            if (arrow == 'A') {
-                if (historyIndex == state.history.size()) draft = input;
-                if (historyIndex > 0) { --historyIndex; input = state.history[historyIndex]; redrawLine(input); }
-            } else if (arrow == 'B') {
-                if (historyIndex < state.history.size()) {
-                    ++historyIndex;
-                    input = historyIndex == state.history.size() ? draft : state.history[historyIndex];
-                    redrawLine(input);
-                }
-            }
-            tabAmbiguous = false; continue;
-        }
-        if (c == '\t') {
-            CompletionContext ctx = completionContext(input);
-            auto candidates = collectCompletions(input, ctx, state);
-            if (candidates.empty()) { std::cout << '\a'; tabAmbiguous = false; continue; }
-            if (candidates.size() == 1) {
-                const auto& choice = candidates[0];
-                if (choice.text.rfind(ctx.prefix, 0) == 0) {
-                    std::string suffix = escapeSuffix(choice.text.substr(ctx.prefix.size()), ctx.quoteMode);
-                    input += suffix; std::cout << suffix;
-                } else {
-                    input.erase(ctx.rawStart);
-                    input += escapeSuffix(choice.text, QuoteMode::Normal);
-                    redrawLine(input);
-                }
-                if (choice.appendSpace) {
-                    if (ctx.quoteMode == QuoteMode::Single) { input += '\''; std::cout << '\''; }
-                    if (ctx.quoteMode == QuoteMode::Double) { input += '"'; std::cout << '"'; }
-                    input += ' '; std::cout << ' ';
-                }
-                tabAmbiguous = false;
-                continue;
-            }
-            std::vector<std::string> names;
-            for (const auto& cnd : candidates) names.push_back(cnd.text);
-            std::sort(names.begin(), names.end());
-            names.erase(std::unique(names.begin(), names.end()), names.end());
-            std::string common = commonPrefix(names);
-            if (common.rfind(ctx.prefix, 0) == 0 && common.size() > ctx.prefix.size()) {
-                std::string suffix = escapeSuffix(common.substr(ctx.prefix.size()), ctx.quoteMode);
-                input += suffix; std::cout << suffix;
-                tabAmbiguous = false;
-            } else if (!tabAmbiguous) {
-                std::cout << '\a'; tabAmbiguous = true;
-            } else {
-                std::cout << '\n';
-                for (size_t i = 0; i < names.size(); ++i) {
-                    if (i) std::cout << "  ";
-                    std::cout << names[i];
-                }
-                std::cout << '\n'; redrawLine(input);
-                tabAmbiguous = false;
-            }
-            continue;
-        }
-        if (static_cast<unsigned char>(c) >= 32 && c != 127) {
-            input += c; std::cout.put(c); tabAmbiguous = false;
-        }
-    }
-}
 
-int waitFor(pid_t pid) {
+    // Parent: wait for the child. waitpid can be interrupted by a signal
+    // (it returns -1 with errno == EINTR). That isn't a real failure, so retry.
     int status = 0;
     pid_t result;
-    do { result = waitpid(pid, &status, 0); } while (result < 0 && errno == EINTR);
-    if (result < 0) { perror("waitpid"); return 1; }
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result == -1 && errno == EINTR);
+
+    if (result == -1) {
+        perror("waitpid");
+        return 1;
+    }
+    // `status` is packed. Decode it with the W* macros.
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);        // Normal exit: its exit code (0-255)
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);     // Killed by signal N -> 128+N (e.g. 130 for Ctrl+C)
+    }
     return 1;
 }
 
-// Execute one pipeline. Single foreground builtins run in the parent, so 'cd' persists.
-int executePipeline(const Pipeline& pipeline, const std::string& source, ShellState& state) {
-    if (pipeline.commands.empty()) return 0;
-    if (pipeline.commands.size() == 1 && !pipeline.background) {
-        const auto& cmd = pipeline.commands[0];
-        if (cmd.args.empty() || isBuiltin(cmd.args[0])) {
-            ScopedRedirections redirs;
-            if (!redirs.apply(cmd.redirects)) return 1;
-            return cmd.args.empty() ? 0 : runBuiltin(cmd.args, state);
+// =============================================================================
+// Line editor
+// =============================================================================
+
+// Read one line of input into `input`. Returns false on end-of-input, which
+// tells main() to exit the shell.
+//
+// Two paths:
+//   * Not a terminal (pipes, test harness): a plain std::getline.
+//   * Terminal: read one byte at a time in non-canonical mode and do the
+//     editing by hand (echo, Backspace, TAB completion, Ctrl+D).
+//
+// Point to note: the TerminalModeGuard is local, so the terminal is only in
+// raw mode while a line is being read. Programs started by the shell (vim,
+// python, ...) see a normal terminal.
+//
+// Limitations (byte-oriented editor):
+//   * Arrow keys send escape sequences like ESC [ A. ESC (27) is dropped, but
+//     '[' and 'A' are printable, so they get inserted into the line.
+//   * Backspace removes one *byte*, so it only removes part of a multi-byte
+//     UTF-8 character.
+//   * There's no cursor movement or history.
+bool readInputLine(std::string& input)
+{
+    TerminalModeGuard terminal;
+
+    /*Preserve normal behavior for redirected stdin and environments without a usable terminal*/
+
+    if(!terminal.active())
+    {
+        return static_cast<bool>(std::getline(std::cin, input));
+    }
+
+    input.clear();
+    // Bash-style double-TAB: the first ambiguous TAB only beeps, and a second
+    // TAB in a row lists all the matches. Any other key resets this flag.
+    bool previousTabWasAmbiguous = false;
+
+    while(true)
+    {
+        char c = '\0';
+
+        // Raw read(2) from fd 0, bypassing std::cin's buffer. Thanks to VMIN = 1
+        // it returns as soon as a single key is pressed.
+        ssize_t bytes = read(STDIN_FILENO, &c, 1);
+
+        if (bytes == 0)
+        {
+            // EOF on the terminal: submit what we have, or report end-of-input.
+            return !input.empty();
+        }
+
+        if (bytes == -1)
+        {
+            // Interrupted by a signal before any byte arrived: try again.
+            if(errno == EINTR)
+                continue;
+
+            return false;
+        }
+
+        // Enter. The ICRNL input flag (still on) normally turns CR into '\n',
+        // but both are accepted to be safe.
+        if(c=='\n'||c =='\r')
+        {
+            std::cout << '\n';
+            return true;
+        }
+
+        // Backspace: most terminals send DEL (127); some send BS (8).
+        if(c == 127 || c == '\b')
+        {
+            previousTabWasAmbiguous = false;
+            if(!input.empty())
+            {
+                input.pop_back();
+                // Move the cursor left, overwrite the char with a space, move left again.
+                std::cout << "\b \b";
+            }
+            continue;
+        }
+
+        // TAB: command-name completion or filename/directory completion.
+        if (c == '\t')
+        {
+            CompletionContext context = getCompletionContext(input);
+            std::vector<CompletionCandidate> candidates;
+
+            // --- Step 1: collect candidates for the word under the cursor ---
+            if (context.isCommand)
+            {
+                if (context.prefix.find('/') == std::string::npos)
+                {
+                    // Bare command names come from builtins and PATH.
+                    for (const auto& name : findExecutableCompletions(context.prefix))
+                        candidates.push_back({name, true});
+                }
+                else
+                {
+                    // A command containing '/' is a path, not a PATH lookup.
+                    // Offer directories (to keep descending) and executable files.
+                    for (const auto& match : findFilenameCompletions(context.prefix))
+                    {
+                        std::error_code ec;
+                        bool executable = std::filesystem::is_regular_file(match.replacement, ec) &&
+                                          access(match.replacement.c_str(), X_OK) == 0;
+                        if (match.isDirectory || executable)
+                            candidates.push_back({match.replacement, !match.isDirectory});
+                    }
+                }
+            }
+            else
+            {
+                // An argument: complete file names. `cd` only makes sense with
+                // directories, so files are filtered out for it.
+                bool directoriesOnly = (context.commandName == "cd");
+                for (const auto& match : findFilenameCompletions(context.prefix, directoriesOnly))
+                    candidates.push_back({match.replacement, !match.isDirectory});
+            }
+
+            // --- Step 2: no match -> ring the terminal bell ('\a', BEL) ---
+            if (candidates.empty())
+            {
+                std::cout << '\a';
+                previousTabWasAmbiguous = false;
+                continue;
+            }
+
+            // --- Step 3: exactly one match -> complete it fully ---
+            // One match: insert the remainder, then '/' for directories or
+            // a closing quote and space for completed quoted filenames.
+            // Only the *missing* part is inserted. Every candidate starts with
+            // context.prefix, so substr(prefix.size()) is the new text.
+            if (candidates.size() == 1)
+            {
+                const auto& candidate = candidates.front();
+                const std::string suffix = candidate.text.substr(context.prefix.size());
+                std::string inserted = escapeCompletionSuffix(suffix, context.quoteMode);
+
+                if (candidate.appendSpace)
+                {
+                    if (context.quoteMode == QuoteMode::Single)
+                        inserted += '\'';
+                    else if (context.quoteMode == QuoteMode::Double)
+                        inserted += '"';
+                    inserted += ' ';
+                }
+
+                // Keep the buffer and the screen in sync: we turned ECHO off,
+                // so we have to print exactly what we add.
+                input += inserted;
+                std::cout << inserted;
+                previousTabWasAmbiguous = false;
+                continue;
+            }
+
+            std::vector<std::string> names;
+            names.reserve(candidates.size());
+            for (const auto& candidate : candidates)
+                names.push_back(candidate.text);
+
+            // --- Step 4: several matches -> insert their shared prefix, if longer ---
+            // Several matches may still share more characters than typed.
+            const std::string common = longestCommonPrefix(names);
+            if (common.size() > context.prefix.size())
+            {
+                std::string inserted = escapeCompletionSuffix(
+                    common.substr(context.prefix.size()), context.quoteMode);
+                input += inserted;
+                std::cout << inserted;
+                previousTabWasAmbiguous = false;
+                continue;
+            }
+
+            // --- Step 5: truly ambiguous -> beep once, then list on the 2nd TAB ---
+            if (!previousTabWasAmbiguous)
+            {
+                std::cout << '\a';
+                previousTabWasAmbiguous = true;
+            }
+            else
+            {
+                // List the matches separated by two spaces, then redraw the prompt and
+                // the current line so the user can keep typing.
+                // Point to note: "$ " is hard-coded here and in main(). If the prompt
+                // changes, update both places.
+                std::cout << '\n';
+                for (size_t i = 0; i < names.size(); ++i)
+                {
+                    if (i > 0)
+                        std::cout << "  ";
+                    std::cout << names[i];
+                }
+                std::cout << "\n$ " << input;
+                previousTabWasAmbiguous = false;
+            }
+            continue;
+        }
+
+        //CTRL+D on an empty line
+        // ASCII 4 = EOT. Like bash, Ctrl+D only exits on an empty line.
+        // Otherwise it's ignored (it's < 32, so the check below skips it).
+        if(c == 4 && input.empty())
+            return false;
+
+
+        //Ordinary printable input (byte-oriented)
+        // Control characters (< 32) such as ESC and Ctrl+letters are dropped.
+        // Bytes >= 128 (UTF-8) are negative as a signed char, so the cast to
+        // unsigned char lets them through.
+        if(static_cast<unsigned char>(c) >= 32 && c != 127)
+        {
+            previousTabWasAmbiguous = false;
+            input.push_back(c);
+            std::cout.put(c);   // Manual echo, since ECHO is off
         }
     }
-    std::cout.flush(); std::cerr.flush();
-    std::vector<pid_t> children;
-    int previousRead = -1;
-    const size_t count = pipeline.commands.size();
-    for (size_t i = 0; i < count; ++i) {
-        int fds[2] = {-1,-1};
-        if (i + 1 < count && pipe(fds) < 0) {
-            perror("pipe");
-            if (previousRead != -1) close(previousRead);
-            for (pid_t p : children) waitFor(p);
-            return 1;
-        }
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            if (previousRead != -1) close(previousRead);
-            if (fds[0] != -1) close(fds[0]);
-            if (fds[1] != -1) close(fds[1]);
-            for (pid_t p : children) waitFor(p);
-            return 1;
-        }
-        if (pid == 0) {
-            signal(SIGINT, SIG_DFL);
-            signal(SIGQUIT, SIG_DFL);
-            if (previousRead != -1) {
-                if (dup2(previousRead, STDIN_FILENO) < 0) _exit(1);
-            }
-            if (fds[1] != -1) {
-                if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(1);
-            }
-            if (previousRead != -1) close(previousRead);
-            if (fds[0] != -1) close(fds[0]);
-            if (fds[1] != -1) close(fds[1]);
-            const Command& command = pipeline.commands[i];
-            if (!applyRedirections(command.redirects)) _exit(1);
-            if (command.args.empty()) _exit(0);
-            if (isBuiltin(command.args[0])) {
-                int status = runBuiltin(command.args, state);
-                std::cout.flush(); std::cerr.flush();
-                _exit(status);
-            }
-            std::string path = findExecutable(command.args[0]);
-            if (path.empty()) {
-                std::cerr << command.args[0] << ": command not found\n";
-                std::cerr.flush(); _exit(127);
-            }
-            std::vector<std::string> storage = command.args;
-            std::vector<char*> argv;
-            argv.reserve(storage.size() + 1);
-            for (auto& arg : storage) argv.push_back(arg.data());
-            argv.push_back(nullptr);
-            execv(path.c_str(), argv.data());
-            perror("execv"); _exit(126);
-        }
-        children.push_back(pid);
-        if (previousRead != -1) close(previousRead);
-        if (fds[1] != -1) close(fds[1]);
-        previousRead = fds[0];
-    }
-    if (previousRead != -1) close(previousRead);
-    if (pipeline.background) {
-        Job job;
-        job.number = nextJobNumber(state);
-        job.launchOrder = state.nextLaunchOrder++;
-        job.pids = children;
-        job.finished.assign(children.size(), false);
-        job.text = source;
-        state.jobs.push_back(std::move(job));
-        std::cout << '[' << state.jobs.back().number << "] " << children.back() << '\n';
-        return 0;
-    }
-    int result = 0;
-    for (size_t i = 0; i < children.size(); ++i) {
-        int code = waitFor(children[i]);
-        if (i + 1 == children.size()) result = code;
-    }
-    return result;
 }
 
+// =============================================================================
+// Entry point: the REPL (Read-Eval-Print Loop)
+// =============================================================================
 int main() {
+    // unitbuf = flush after every output operation. Without it the "$ " prompt
+    // could sit in the buffer and never appear, and our output could interleave
+    // badly with output from child processes, which write to the fd directly.
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
-    signal(SIGINT, SIG_IGN);
-    signal(SIGQUIT, SIG_IGN);
-    ShellState state;
-    initialHistory(state);
-    while (!state.shouldExit) {
-        announceFinishedJobs(state);
+
+    while (true) {
         std::cout << "$ ";
-        std::string line;
-        if (!readInputLine(line, state)) break;
-        if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-        state.history.push_back(line);
-        try {
-            Pipeline pipeline = parsePipeline(lex(line, state));
-            state.lastStatus = executePipeline(pipeline, line, state);
-        } catch (const std::exception& e) {
-            std::cerr << "shell: " << e.what() << '\n';
-            state.lastStatus = 2;
+        std::string input;
+        if (!readInputLine(input)) {
+            break;   // EOF / Ctrl+D -> leave the loop and exit with status 0
+        }
+
+        // Lex and parse. Syntax errors are reported, then we show a new prompt.
+        ParsedCommand command;
+        try
+        {
+            command = parseCommand(tokenize(input));
+        } catch (const std::runtime_error& error)
+        {
+            std::cerr << "shell: " << error.what() << '\n';
+            continue;
+        }
+
+        if (command.arguments.empty())
+        {
+            // Empty line, or only redirections.
+            // A bare redirection can still create/truncate a file.
+            // (e.g. `> log.txt` empties log.txt, like in bash.)
+            ScopedRedirections redirects;
+            redirects.apply(command.redirections);
+            continue;
+        }
+
+        if (isBuiltin(command.arguments[0]))
+        {
+            // Builtins run in this process, so the redirections must be undone
+            // afterwards. `redirects` does that when it goes out of scope.
+            ScopedRedirections redirects;
+            if (!redirects.apply(command.redirections)) {
+                continue;
+            }
+            if (command.arguments[0] == "exit") {
+                // `exit` or `exit N`. Points to note: atoi() returns 0 for
+                // non-numeric text, and the OS keeps only the low 8 bits
+                // (exit 256 -> status 0). Returning from main (instead of
+                // calling std::exit) runs the destructors properly.
+                return command.arguments.size() > 1
+                    ? std::atoi(command.arguments[1].c_str()) : 0;
+            }
+            executeBuiltin(command.arguments);
+        } else {
+            // Everything else is a program on disk: fork + exec.
+ing input;
+        if (!readInputLine(input)) {
+            break;
+        }
+
+        ParsedCommand command;
+        try 
+        {
+            command = parseCommand(tokenize(input));
+        } catch (const std::runtime_error& error) 
+        {
+            std::cerr << "shell: " << error.what() << '\n';
+            continue;
+        }
+
+        if (command.arguments.empty()) 
+        {
+            // A bare redirection can still create/truncate a file.
+            ScopedRedirections redirects;
+            redirects.apply(command.redirections);
+            continue;
+        }
+
+        if (isBuiltin(command.arguments[0])) 
+        {
+            ScopedRedirections redirects;
+            if (!redirects.apply(command.redirections)) {
+                continue;
+            }
+            if (command.arguments[0] == "exit") {
+                return command.arguments.size() > 1
+                    ? std::atoi(command.arguments[1].c_str()) : 0;
+            }
+            executeBuiltin(command.arguments);
+        } else {
+            executeExternal(command);
         }
     }
-    saveHistoryOnExit(state);
-    return state.shouldExit ? state.exitCode : state.lastStatus;
+
+    return 0;
 }
