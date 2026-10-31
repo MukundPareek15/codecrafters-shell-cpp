@@ -787,8 +787,8 @@ std::vector<Candidate> collectCompletions(const std::string& line,
                it != state.completions.end()) {
         for (const auto& text : runCompleter(it->second, ctx, line, state))
             choices.push_back({text, true});
-    } else if (!ctx.prefix.empty()) {
-        // Do not auto-select arbitrary files on a blank argument.
+    } else {
+        // A blank argument lists the current directory (dotfiles stay hidden).
         choices = filenameCompletions(ctx.prefix, ctx.commandName == "cd");
     }
     return choices;
