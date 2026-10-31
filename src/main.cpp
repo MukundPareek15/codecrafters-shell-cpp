@@ -534,12 +534,20 @@ int runBuiltin(const std::vector<std::string>& args, ShellState& state) {
             specific = std::atoi(n.c_str());
         }
         bool found = false;
-        for (const auto& job : state.jobs) {
+        for (auto& job : state.jobs) {
             if (specific >= 0 && job.number != specific) continue;
             found = true;
+            // Like bash: pad the status to 24 columns; only running jobs show the '&'.
+            bool done = jobFinished(job);
+            std::string status = done ? "Done" : "Running";
+            status.resize(24, ' ');
             std::cout << '[' << job.number << ']' << jobMarker(state, job.number)
-                      << "  " << (jobFinished(job) ? "Done" : "Running") << "                 " << job.text << '\n';
+                      << "  " << status << job.text << (done ? "" : " &") << '\n';
+            if (done) job.notified = true;
         }
+        // A finished job reported here is not announced again before the next prompt.
+        state.jobs.erase(std::remove_if(state.jobs.begin(), state.jobs.end(),
+            [](const Job& j) { return j.notified; }), state.jobs.end());
         if (specific >= 0 && !found) { std::cerr << "jobs: %" << specific << ": no such job\n"; return 1; }
         return 0;
     }
@@ -787,8 +795,8 @@ std::vector<Candidate> collectCompletions(const std::string& line,
                it != state.completions.end()) {
         for (const auto& text : runCompleter(it->second, ctx, line, state))
             choices.push_back({text, true});
-    } else if (!ctx.prefix.empty()) {
-        // Do not auto-select arbitrary files on a blank argument.
+    } else {
+        // A blank argument lists the current directory (dotfiles stay hidden).
         choices = filenameCompletions(ctx.prefix, ctx.commandName == "cd");
     }
     return choices;
@@ -983,7 +991,8 @@ int executePipeline(const Pipeline& pipeline, const std::string& source, ShellSt
         job.launchOrder = state.nextLaunchOrder++;
         job.pids = children;
         job.finished.assign(children.size(), false);
-        job.text = source;
+        // Store the command without its trailing '&'; 'jobs' re-adds it for running jobs.
+        job.text = source.substr(0, source.find_last_not_of(" \t&") + 1);
         state.jobs.push_back(std::move(job));
         std::cout << '[' << state.jobs.back().number << "] " << children.back() << '\n';
         return 0;
