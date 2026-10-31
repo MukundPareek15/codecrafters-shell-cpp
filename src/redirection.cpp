@@ -1,4 +1,25 @@
-
+// =============================================================================
+// ARCHIVED SNAPSHOT: this whole file is inside one /* ... */ block and
+// compiles to nothing.
+// =============================================================================
+// This is an earlier version of the shell, saved after the "redirection" stage
+// of the CodeCrafters course. The live code is in src/main.cpp, which has
+// detailed comments on every function below.
+//
+// Points to note:
+//  * CMakeLists.txt uses file(GLOB_RECURSE ... src/*.cpp), so this file IS
+//    compiled. Since everything is commented out, it adds nothing to the
+//    binary. If you uncomment it, you'll get "multiple definition" linker
+//    errors for main(), tokenize(), and the rest, because main.cpp defines them too.
+//  * What changed between this snapshot and main.cpp:
+//      - Input was a plain std::getline(). main.cpp adds readInputLine(),
+//        with raw terminal mode (TerminalModeGuard) and TAB completion.
+//      - There were no completion helpers (getCompletionContext,
+//        findFilenameCompletions, findExecutableCompletions,
+//        longestCommonPrefix, escapeCompletionSuffix).
+//  * Reading this next to main.cpp is a good way to see how the line editor
+//    was added on top of an unchanged tokenize -> parse -> execute pipeline.
+// =============================================================================
 
 /*
 #include <cerrno>
